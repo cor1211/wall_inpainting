@@ -1,0 +1,35 @@
+# --- Core HuggingFace & Diffusers ---
+diffusers>=0.27.2
+transformers>=4.39.0
+accelerate>=0.28.0
+safetensors>=0.4.2
+huggingface-hub>=0.22.0
+
+# --- Computer Vision & Image Processing ---
+opencv-python>=4.9.0.80
+Pillow>=10.2.0
+scipy>=1.12.0
+timm>=0.9.16
+
+# --- Segmentation (FastSAM/YOLO) ---
+ultralytics>=8.1.47
+# FastSAM thường dùng core của ultralytics hoặc yêu cầu supervision
+supervision>=0.19.0
+
+# --- ControlNet Preprocessors ---
+# Thư viện này giúp tạo Depth Map từ ảnh gốc một cách tự động
+controlnet-aux>=0.0.9
+mediapipe>=0.10.11
+
+# --- Utilities & Math ---
+numpy<2.0.0
+# Numpy 2.0 mới ra mắt gây lỗi với nhiều thư viện AI cũ, nên ta giữ ở bản 1.x
+einops>=0.7.0
+
+# --- API Serving (Chuẩn bị cho bước đưa lên Web sau này) ---
+fastapi>=0.110.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
+
+# --- CLIP for semantic filtering ---
+git+https://github.com/openai/CLIP.git
