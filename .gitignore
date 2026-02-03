@@ -4,6 +4,8 @@
 *.onnx
 *.safetensors
 *.bin
+*.rar
+training_ready
 
 # Python
 __pycache__/
@@ -42,3 +44,4 @@ models/
 
 2.6.0
 
+lora_checkpoints/checkpoint-1000

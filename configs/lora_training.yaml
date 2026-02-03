@@ -1,0 +1,81 @@
+# LoRA Training Configuration for Wall Inpainting
+
+model:
+  pretrained_model_name_or_path: "runwayml/stable-diffusion-inpainting"
+  revision: null
+  variant: null
+  
+  # LoRA parameters
+  lora_rank: 8                    # Low-rank dimension (4-16 typical)
+  lora_alpha: 16                  # Scaling factor (usually 2x rank)
+  lora_dropout: 0.0               # Dropout for LoRA layers
+  target_modules:                 # UNet attention layers to apply LoRA
+    - "to_k"
+    - "to_q" 
+    - "to_v"
+    - "to_out.0"
+
+dataset:
+  train_data_dir: "training_ready/train"
+  validation_data_dir: "training_ready/validation"
+  resolution: 512
+  center_crop: true
+  random_flip: true
+  quality_threshold: 0.5          # Minimum quality score
+  dataloader_num_workers: 4
+
+training:
+  # Batch settings (optimal for 12GB VRAM - RTX 3060 Ti)
+  train_batch_size: 4             # Optimal throughput: 3.99s/step
+  gradient_accumulation_steps: 2  # Effective batch = 8
+  # Effective batch size = 4 * 2 = 8
+  
+  # Learning rate
+  learning_rate: 1.0e-4
+  lr_scheduler: "cosine"
+  lr_warmup_steps: 500
+  lr_num_cycles: 1
+  
+  # Training duration
+  num_train_epochs: 10
+  max_train_steps: 15000          # ~1.26 epochs with 11.8k samples
+  
+  # Optimization (VRAM optimized)
+  use_8bit_adam: true             # Saves ~1-2GB VRAM
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-2
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  
+  # Mixed precision
+  mixed_precision: "fp16"
+  gradient_checkpointing: true    # Saves ~30-40% VRAM
+  
+  # Memory optimization  
+  enable_xformers: true           # Saves ~20-30% VRAM if available
+  enable_vae_slicing: true        # Process VAE in slices
+  enable_vae_tiling: true         # Process large images in tiles
+  
+  # Reproducibility
+  seed: 42
+
+checkpointing:
+  output_dir: "lora_checkpoints"
+  checkpointing_steps: 1000
+  resume_from_checkpoint: null    # Path to resume from
+  
+validation:
+  validation_steps: 500           # Generate samples every N steps
+  num_validation_samples: 4
+  validation_prompts:
+    - "interior room with beige walls, professional photography"
+    - "a room with terracotta painted walls, modern interior"
+    - "gray walls in elegant living room"
+    - "dusty rose walls in cozy bedroom"
+
+logging:
+  report_to: "tensorboard"        # "tensorboard", "wandb", or "none"
+  logging_dir: "logs"
+  log_with_wandb: false
+  wandb_project: "wall-inpainting-lora"
