@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Wall Inpainting - Thay đổi màu tường thông minh</title>
+    <meta name="description" content="Công cụ AI thay đổi màu sắc và chất liệu tường trong ảnh nội thất">
+    <link rel="stylesheet" href="css/styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="logo">
+            <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+                <polyline points="9 22 9 12 15 12 15 22" />
+            </svg>
+            <h1>AI Wall Inpainting</h1>
+        </div>
+        <div class="header-actions">
+            <button id="btn-health" class="btn btn-ghost" title="Kiểm tra kết nối">
+                <span class="status-dot" id="status-dot"></span>
+                <span id="status-text">Đang kết nối...</span>
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Layout -->
+    <main class="main-layout">
+        <!-- Sidebar Controls -->
+        <aside class="sidebar">
+            <!-- Step 1: Upload -->
+            <section class="control-section">
+                <h2 class="section-title">
+                    <span class="step-number">1</span>
+                    Upload ảnh nội thất
+                </h2>
+                <div class="upload-zone" id="upload-zone">
+                    <input type="file" id="source-input" accept="image/*" hidden>
+                    <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                        <polyline points="17 8 12 3 7 8" />
+                        <line x1="12" y1="3" x2="12" y2="15" />
+                    </svg>
+                    <p>Kéo thả hoặc click để chọn ảnh</p>
+                    <span class="upload-hint">PNG, JPG, WEBP (tối đa 20MB)</span>
+                </div>
+                <div class="source-preview" id="source-preview" hidden>
+                    <img id="source-thumb" alt="Source preview">
+                    <button class="btn btn-icon btn-remove" id="btn-remove-source" title="Xóa ảnh">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="18" y1="6" x2="6" y2="18" />
+                            <line x1="6" y1="6" x2="18" y2="18" />
+                        </svg>
+                    </button>
+                </div>
+            </section>
+
+            <!-- Step 2: Mask -->
+            <section class="control-section">
+                <h2 class="section-title">
+                    <span class="step-number">2</span>
+                    Chọn vùng tường
+                </h2>
+                <div class="mask-controls">
+                    <button class="btn btn-primary btn-block" id="btn-auto-segment" disabled>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10" />
+                            <path d="M12 16v-4" />
+                            <path d="M12 8h.01" />
+                        </svg>
+                        Auto Segment
+                    </button>
+                    <div class="segment-options">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="include-ceiling">
+                            <span>Bao gồm trần nhà</span>
+                        </label>
+                    </div>
+                    <div class="brush-controls" id="brush-controls">
+                        <div class="brush-tools">
+                            <button class="btn btn-tool active" id="btn-brush-add" title="Thêm vùng chọn (Click trái)">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M12 5v14M5 12h14" />
+                                </svg>
+                            </button>
+                            <button class="btn btn-tool" id="btn-brush-remove" title="Xóa vùng chọn (Click phải)">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M5 12h14" />
+                                </svg>
+                            </button>
+                            <button class="btn btn-tool" id="btn-undo" title="Undo (Ctrl+Z)" disabled>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M3 7v6h6" />
+                                    <path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13" />
+                                </svg>
+                            </button>
+                            <button class="btn btn-tool" id="btn-redo" title="Redo (Ctrl+Y)" disabled>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21 7v6h-6" />
+                                    <path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13" />
+                                </svg>
+                            </button>
+                            <button class="btn btn-tool" id="btn-clear-mask" title="Xóa toàn bộ mask">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="3 6 5 6 21 6" />
+                                    <path
+                                        d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="brush-size">
+                            <label>Brush Size</label>
+                            <input type="range" id="brush-size" min="5" max="100" value="30">
+                            <span id="brush-size-value">30px</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Step 3: Style -->
+            <section class="control-section">
+                <h2 class="section-title">
+                    <span class="step-number">3</span>
+                    Chọn màu/chất liệu
+                </h2>
+                <div class="style-tabs">
+                    <button class="tab-btn active" data-tab="color">Màu sắc</button>
+                    <button class="tab-btn" data-tab="reference">Texture</button>
+                </div>
+
+                <!-- Color Tab -->
+                <div class="tab-content active" id="tab-color">
+                    <div class="color-picker-wrapper">
+                        <input type="color" id="color-picker" value="#c8b4a0">
+                        <input type="text" id="color-hex" value="#c8b4a0" placeholder="#RRGGBB">
+                    </div>
+                    <div class="color-presets">
+                        <button class="color-preset" style="background:#f5f5f5" data-color="#f5f5f5"
+                            title="Trắng"></button>
+                        <button class="color-preset" style="background:#e8dcc8" data-color="#e8dcc8"
+                            title="Kem"></button>
+                        <button class="color-preset" style="background:#c8b4a0" data-color="#c8b4a0"
+                            title="Be"></button>
+                        <button class="color-preset" style="background:#b8c4c8" data-color="#b8c4c8"
+                            title="Xám xanh"></button>
+                        <button class="color-preset" style="background:#d4c4b0" data-color="#d4c4b0"
+                            title="Nâu nhạt"></button>
+                        <button class="color-preset" style="background:#a8b8a8" data-color="#a8b8a8"
+                            title="Xanh lá"></button>
+                        <button class="color-preset" style="background:#c8d4e8" data-color="#c8d4e8"
+                            title="Xanh dương"></button>
+                        <button class="color-preset" style="background:#3a3a3a" data-color="#3a3a3a"
+                            title="Xám đen"></button>
+                    </div>
+                </div>
+
+                <!-- Reference Tab -->
+                <div class="tab-content" id="tab-reference">
+                    <div class="upload-zone upload-zone-small" id="reference-zone">
+                        <input type="file" id="reference-input" accept="image/*" hidden>
+                        <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                            <circle cx="8.5" cy="8.5" r="1.5" />
+                            <polyline points="21 15 16 10 5 21" />
+                        </svg>
+                        <p>Upload ảnh texture/chất liệu</p>
+                    </div>
+                    <div class="reference-preview" id="reference-preview" hidden>
+                        <img id="reference-thumb" alt="Reference preview">
+                        <button class="btn btn-icon btn-remove" id="btn-remove-reference" title="Xóa">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="18" y1="6" x2="6" y2="18" />
+                                <line x1="6" y1="6" x2="18" y2="18" />
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Advanced Settings -->
+            <details class="control-section advanced-section">
+                <summary class="section-title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="3" />
+                        <path
+                            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                    </svg>
+                    Cài đặt nâng cao
+                </summary>
+                <div class="advanced-controls">
+                    <div class="control-group">
+                        <label>Inference Steps</label>
+                        <input type="range" id="steps" min="10" max="50" value="30">
+                        <span id="steps-value">30</span>
+                    </div>
+                    <div class="control-group">
+                        <label>ControlNet Scale</label>
+                        <input type="range" id="controlnet-scale" min="0" max="100" value="80">
+                        <span id="controlnet-value">0.8</span>
+                    </div>
+                    <div class="control-group">
+                        <label>IP-Adapter Scale</label>
+                        <input type="range" id="ip-scale" min="0" max="100" value="70">
+                        <span id="ip-value">0.7</span>
+                    </div>
+                    <div class="control-group">
+                        <label>Seed (optional)</label>
+                        <input type="number" id="seed" placeholder="Random" min="0">
+                    </div>
+                </div>
+            </details>
+
+            <!-- Generate Button -->
+            <div class="generate-section">
+                <button class="btn btn-generate" id="btn-generate" disabled>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                    </svg>
+                    Generate
+                </button>
+            </div>
+        </aside>
+
+        <!-- Canvas Area -->
+        <div class="canvas-area">
+            <div class="canvas-container" id="canvas-container">
+                <!-- Empty State -->
+                <div class="canvas-empty" id="canvas-empty">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                        <circle cx="8.5" cy="8.5" r="1.5" />
+                        <polyline points="21 15 16 10 5 21" />
+                    </svg>
+                    <h3>Chưa có ảnh</h3>
+                    <p>Upload ảnh nội thất để bắt đầu</p>
+                </div>
+
+                <!-- Canvas -->
+                <canvas id="main-canvas"></canvas>
+                <canvas id="mask-canvas"></canvas>
+
+                <!-- Brush Cursor -->
+                <div class="brush-cursor" id="brush-cursor"></div>
+            </div>
+
+            <!-- Canvas Toolbar -->
+            <div class="canvas-toolbar" id="canvas-toolbar" hidden>
+                <div class="zoom-controls">
+                    <button class="btn btn-icon" id="btn-zoom-out" title="Thu nhỏ">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="11" cy="11" r="8" />
+                            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                            <line x1="8" y1="11" x2="14" y2="11" />
+                        </svg>
+                    </button>
+                    <span id="zoom-level">100%</span>
+                    <button class="btn btn-icon" id="btn-zoom-in" title="Phóng to">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="11" cy="11" r="8" />
+                            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                            <line x1="11" y1="8" x2="11" y2="14" />
+                            <line x1="8" y1="11" x2="14" y2="11" />
+                        </svg>
+                    </button>
+                    <button class="btn btn-icon" id="btn-zoom-fit" title="Vừa khung">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path
+                                d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+                        </svg>
+                    </button>
+                </div>
+                <div class="mask-opacity">
+                    <label>Mask opacity:</label>
+                    <input type="range" id="mask-opacity" min="0" max="100" value="50">
+                </div>
+            </div>
+        </div>
+
+        <!-- Result Panel -->
+        <aside class="result-panel" id="result-panel" hidden>
+            <div class="result-header">
+                <h2>Kết quả</h2>
+                <button class="btn btn-icon" id="btn-close-result" title="Đóng">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18" />
+                        <line x1="6" y1="6" x2="18" y2="18" />
+                    </svg>
+                </button>
+            </div>
+
+            <!-- Before/After Slider -->
+            <div class="comparison-container" id="comparison-container">
+                <div class="comparison-wrapper">
+                    <img id="result-before" alt="Before">
+                    <div class="comparison-overlay" id="comparison-overlay">
+                        <img id="result-after" alt="After">
+                    </div>
+                    <div class="comparison-slider" id="comparison-slider">
+                        <div class="slider-handle">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M18 8l4 4-4 4M6 8l-4 4 4 4" />
+                            </svg>
+                        </div>
+                    </div>
+                    <div class="comparison-labels">
+                        <span class="label-before">Trước</span>
+                        <span class="label-after">Sau</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="result-actions">
+                <button class="btn btn-primary" id="btn-download">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                        <polyline points="7 10 12 15 17 10" />
+                        <line x1="12" y1="15" x2="12" y2="3" />
+                    </svg>
+                    Tải về
+                </button>
+                <button class="btn btn-secondary" id="btn-regenerate">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="23 4 23 10 17 10" />
+                        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                    </svg>
+                    Tạo lại
+                </button>
+            </div>
+
+            <div class="result-info" id="result-info"></div>
+        </aside>
+    </main>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loading-overlay" hidden>
+        <div class="loading-content">
+            <div class="loading-spinner"></div>
+            <h3 id="loading-title">Đang xử lý...</h3>
+            <p id="loading-message">AI đang thay đổi màu tường, vui lòng đợi...</p>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <!-- Scripts -->
+    <script>
+        // Debug: Check if scripts are loading
+        window.onerror = function (msg, url, line, col, error) {
+            console.error('Global error:', msg, 'at', url, 'line', line);
+            alert('JavaScript Error: ' + msg + '\nLine: ' + line);
+            return false;
+        };
+        console.log('Page loaded, scripts starting...');
+    </script>
+    <script src="js/utils.js"></script>
+    <script src="js/state.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/canvas.js"></script>
+    <script src="js/components.js"></script>
+    <script src="js/app.js"></script>
+</body>
+
+</html>

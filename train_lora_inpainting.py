@@ -424,7 +424,7 @@ def generate_validation_samples(
     accelerator, unet, vae, text_encoder, tokenizer,
     noise_scheduler, config, output_dir, global_step, weight_dtype
 ):
-    """Generate validation samples during training."""
+    """Generate validation samples during training using real validation data."""
     try:
         # Create a simple pipeline for inference
         pipeline = StableDiffusionInpaintPipeline(
@@ -439,19 +439,41 @@ def generate_validation_samples(
         )
         pipeline.set_progress_bar_config(disable=True)
         
-        # Use a validation image (create a dummy one for now)
-        # In production, you'd load actual validation images
-        val_image = Image.new("RGB", (512, 512), (200, 200, 200))
-        val_mask = Image.new("L", (512, 512), 255)  # Full mask
-        
+        # Load validation examples
         val_dir = output_dir / "validation_samples"
         val_dir.mkdir(exist_ok=True)
         
+        # Helper to load dataset samples
+        val_dataset_path = Path(config["dataset"]["train_data_dir"]).parent / "validation"
+        val_dataset = InpaintingDataset(
+            data_root=Path(config["dataset"]["train_data_dir"]).parent,
+            split="validation",
+            resolution=config["dataset"]["resolution"],
+            max_samples=4
+        )
+        
         generator = torch.Generator(device=accelerator.device).manual_seed(42)
         
-        for i, prompt in enumerate(config["validation"]["validation_prompts"][:4]):
+        logger.info(f"Generating {len(val_dataset)} validation samples...")
+        
+        for i in range(min(4, len(val_dataset))):
+            sample = val_dataset[i]
+            
+            # Prepare inputs (convert back from tensor for pipeline)
+            # Tensor is [-1, 1], convert to PIL [0, 255]
+            image_tensor = sample["pixel_values"]
+            image_np = ((image_tensor.permute(1, 2, 0).cpu().numpy() + 1) * 127.5).astype(np.uint8)
+            val_image = Image.fromarray(image_np)
+            
+            # Mask tensor is [1, H, W], convert to PIL L
+            mask_tensor = sample["mask"]
+            mask_np = (mask_tensor.squeeze().cpu().numpy() * 255).astype(np.uint8)
+            val_mask = Image.fromarray(mask_np, mode="L")
+            
+            prompt = sample["caption"]
+            
             with torch.autocast("cuda"):
-                image = pipeline(
+                result = pipeline(
                     prompt=prompt,
                     image=val_image,
                     mask_image=val_mask,
@@ -459,12 +481,21 @@ def generate_validation_samples(
                     generator=generator,
                 ).images[0]
             
-            image.save(val_dir / f"step_{global_step}_sample_{i}.png")
+            # Save grid: Original | Mask | Result
+            w, h = val_image.size
+            grid = Image.new("RGB", (w * 3, h))
+            grid.paste(val_image, (0, 0))
+            grid.paste(val_mask.convert("RGB"), (w, 0))
+            grid.paste(result, (w * 2, 0))
+            
+            grid.save(val_dir / f"step_{global_step}_sample_{i}.png")
         
         logger.info(f"Saved validation samples to {val_dir}")
         
     except Exception as e:
         logger.warning(f"Validation failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
