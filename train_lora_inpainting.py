@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import gc
+import json
 import yaml
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -304,9 +305,41 @@ def main():
     # Training loop
     logger.info("***** Starting training *****")
     global_step = 0
+    initial_global_step = 0
+    
+    # Resume from checkpoint if specified
+    if args.resume:
+        resume_path = Path(args.resume)
+        if resume_path.exists():
+            logger.info(f"Resuming from checkpoint: {resume_path}")
+            accelerator.load_state(str(resume_path))
+            
+            # Try to restore global_step from training_state.json
+            state_file = resume_path.parent / "training_state.json" if "checkpoint" in resume_path.name else resume_path / "training_state.json"
+            if not state_file.exists():
+                state_file = output_dir / "training_state.json"
+            
+            if state_file.exists():
+                with open(state_file, "r") as f:
+                    training_state = json.load(f)
+                global_step = training_state.get("global_step", 0)
+                initial_global_step = global_step
+                logger.info(f"Resumed at global_step={global_step}")
+            else:
+                # Try to infer from checkpoint name
+                try:
+                    global_step = int(resume_path.name.split("-")[-1])
+                    initial_global_step = global_step
+                    logger.info(f"Inferred global_step={global_step} from checkpoint name")
+                except ValueError:
+                    logger.warning("Could not determine global_step, starting from 0")
+        else:
+            logger.warning(f"Resume path not found: {resume_path}")
+    
     progress_bar = tqdm(
-        range(max_train_steps),
+        range(initial_global_step, max_train_steps),
         desc="Training",
+        initial=initial_global_step,
         disable=not accelerator.is_local_main_process,
     )
     
@@ -387,11 +420,23 @@ def main():
                     step=global_step,
                 )
                 
-                # Save checkpoint
                 if global_step % config["checkpointing"]["checkpointing_steps"] == 0:
                     if accelerator.is_main_process:
                         save_path = output_dir / f"checkpoint-{global_step}"
                         accelerator.save_state(str(save_path))
+                        
+                        # Save training state metadata
+                        training_state = {
+                            "global_step": global_step,
+                            "epoch": epoch,
+                            "loss": loss.detach().item(),
+                            "learning_rate": lr_scheduler.get_last_lr()[0],
+                            "checkpoint_path": str(save_path),
+                        }
+                        state_file = output_dir / "training_state.json"
+                        with open(state_file, "w") as f:
+                            json.dump(training_state, f, indent=2)
+                        
                         logger.info(f"Saved checkpoint to {save_path}")
                 
                 # Validation
@@ -414,6 +459,16 @@ def main():
     if accelerator.is_main_process:
         unet_unwrapped = accelerator.unwrap_model(unet)
         unet_unwrapped.save_pretrained(output_dir)
+        
+        # Save final training state
+        final_state = {
+            "global_step": global_step,
+            "status": "completed",
+            "total_steps": max_train_steps,
+        }
+        with open(output_dir / "training_state.json", "w") as f:
+            json.dump(final_state, f, indent=2)
+        
         logger.info(f"Final model saved to {output_dir}")
     
     accelerator.end_training()

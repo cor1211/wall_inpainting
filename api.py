@@ -52,10 +52,26 @@ def get_segmenter() -> WallSegmenter:
 
 
 def get_pipeline() -> WallReskinPipeline:
-    """Get or create pipeline instance."""
+    """Get or create pipeline instance with LoRA if configured."""
     global _pipeline
     if _pipeline is None:
-        _pipeline = WallReskinPipeline()
+        # Check if LoRA is enabled in config
+        lora_path = None
+        lora_scale = 1.0
+        if config.lora.enabled:
+            from pathlib import Path
+            lora_dir = Path(config.lora.default_path)
+            if lora_dir.exists() and (lora_dir / "adapter_config.json").exists():
+                lora_path = str(lora_dir)
+                lora_scale = config.lora.default_scale
+                print(f"LoRA enabled: {lora_path} (scale={lora_scale})")
+            else:
+                print(f"LoRA path not found or invalid: {lora_dir}, loading without LoRA")
+        
+        _pipeline = WallReskinPipeline(
+            lora_path=lora_path,
+            lora_scale=lora_scale,
+        )
     return _pipeline
 
 

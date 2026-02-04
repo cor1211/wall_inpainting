@@ -72,6 +72,23 @@ class PipelineConfig:
 
 
 @dataclass
+class LoRAConfig:
+    """Configuration for LoRA adapters."""
+    
+    # Enable LoRA loading
+    enabled: bool = True
+    
+    # Default LoRA checkpoint path
+    default_path: str = "lora_checkpoints"
+    
+    # Default LoRA strength (0.0 - 1.0)
+    default_scale: float = 1.0
+    
+    # Allow dynamic LoRA selection via API
+    allow_dynamic_selection: bool = False
+
+
+@dataclass
 class APIConfig:
     """Configuration for FastAPI server."""
     
@@ -95,6 +112,7 @@ class Config:
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     api: APIConfig = field(default_factory=APIConfig)
+    lora: LoRAConfig = field(default_factory=LoRAConfig)
     
     # Global settings
     device: Optional[str] = None  # None = auto-detect

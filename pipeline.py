@@ -35,6 +35,8 @@ class WallReskinPipeline:
         ip_adapter_model: str = "h94/IP-Adapter",
         device: Optional[str] = None,
         enable_cpu_offload: bool = True,
+        lora_path: Optional[str] = None,
+        lora_scale: float = 1.0,
     ):
         """
         Initialize the wall re-skinning pipeline.
@@ -45,6 +47,8 @@ class WallReskinPipeline:
             ip_adapter_model: HuggingFace ID for IP-Adapter.
             device: Device to run on (auto-detect if None).
             enable_cpu_offload: Enable CPU offloading for memory optimization.
+            lora_path: Optional path to LoRA checkpoint directory.
+            lora_scale: LoRA strength multiplier (0.0-1.0).
         """
         self.device = device or DEVICE
         self.dtype = DTYPE if self.device == "cuda" else torch.float32
@@ -54,11 +58,16 @@ class WallReskinPipeline:
         self.controlnet_model_id = controlnet_model
         self.ip_adapter_model_id = ip_adapter_model
         
+        # LoRA configuration
+        self.lora_path = lora_path
+        self.lora_scale = lora_scale
+        
         # Lazy loading
         self._pipe = None
         self._depth_estimator = None
         
-        print(f"WallReskinPipeline initialized (device: {self.device})")
+        lora_info = f", LoRA: {lora_path}" if lora_path else ""
+        print(f"WallReskinPipeline initialized (device: {self.device}{lora_info})")
     
     def _load_pipeline(self):
         """Load the diffusion pipeline with ControlNet and IP-Adapter."""
@@ -97,11 +106,17 @@ class WallReskinPipeline:
         )
         self._pipe.set_ip_adapter_scale(0.7)  # Default scale
         
+        # Load LoRA BEFORE enabling CPU offload (PEFT is incompatible with offload hooks)
+        self._load_lora()
+        
         # 4. Optimization
-        if self.enable_cpu_offload:
+        # Note: CPU offload is disabled when LoRA is active due to PEFT hook conflicts
+        if self.enable_cpu_offload and self.lora_path is None:
             self._pipe.enable_model_cpu_offload()
         else:
             self._pipe.to(self.device)
+            if self.lora_path is not None:
+                print("  Note: CPU offload disabled (incompatible with LoRA/PEFT)")
         
         # Try to enable xformers for memory efficiency
         try:
@@ -126,6 +141,53 @@ class WallReskinPipeline:
             device=0 if self.device == "cuda" else -1,
         )
         print("Depth estimator loaded!")
+    
+    def _load_lora(self):
+        """Load LoRA weights if specified."""
+        if self.lora_path is None:
+            return
+        
+        from lora_utils import load_lora_weights
+        
+        load_lora_weights(
+            self._pipe,
+            self.lora_path,
+            lora_scale=self.lora_scale,
+            adapter_name="wall_inpainting",
+        )
+    
+    def set_lora(
+        self,
+        lora_path: Optional[str] = None,
+        scale: float = 1.0,
+    ) -> None:
+        """
+        Load or change LoRA weights dynamically.
+        
+        Args:
+            lora_path: Path to new LoRA checkpoint. If None, unload current LoRA.
+            scale: LoRA strength multiplier.
+        """
+        # Ensure pipeline is loaded
+        self._load_pipeline()
+        
+        from lora_utils import load_lora_weights, unload_lora
+        
+        if lora_path is None:
+            # Unload current LoRA
+            unload_lora(self._pipe, adapter_name="wall_inpainting")
+            self.lora_path = None
+            self.lora_scale = 1.0
+        else:
+            # Load new LoRA
+            load_lora_weights(
+                self._pipe,
+                lora_path,
+                lora_scale=scale,
+                adapter_name="wall_inpainting",
+            )
+            self.lora_path = lora_path
+            self.lora_scale = scale
     
     @property
     def pipe(self):
