@@ -46,7 +46,18 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from dataset_inpainting import InpaintingDataset, InpaintingCollator, prepare_mask_and_masked_image
+from dataset_fix import WallInpaintingDataset, WallInpaintingCollator, dominant_color_to_pil
+from dataset_inpainting import prepare_mask_and_masked_image
+from validation_utils import (
+    ValidationVisualizer, 
+    ValidationSample, 
+    compute_color_fidelity_metrics,
+    tensor_to_pil,
+    mask_tensor_to_pil,
+    depth_tensor_to_pil,
+    create_segment_overlay,
+)
+from ip_adapter_utils import IPAdapterImageEncoder, freeze_ip_adapter_weights
 
 logger = get_logger(__name__)
 
@@ -85,12 +96,16 @@ def load_config(config_path: str) -> dict:
 
 
 def collate_fn(examples, tokenizer):
-    """Collate function for DataLoader."""
+    """Collate function for DataLoader with reference image support."""
     pixel_values = torch.stack([e["pixel_values"] for e in examples])
     masks = torch.stack([e["mask"] for e in examples])
     
-    # Tokenize captions
-    captions = [e["caption"] for e in examples]
+    # Reference images (solid color from dominant color extraction)
+    reference_images = torch.stack([e["reference_image"] for e in examples]) if "reference_image" in examples[0] else None
+    dominant_colors = torch.stack([e["dominant_color"] for e in examples]) if "dominant_color" in examples[0] else None
+    
+    # Tokenize captions (empty for Zero-Prompt strategy)
+    captions = [e.get("caption", "") for e in examples]
     inputs = tokenizer(
         captions,
         max_length=tokenizer.model_max_length,
@@ -99,11 +114,18 @@ def collate_fn(examples, tokenizer):
         return_tensors="pt",
     )
     
-    return {
+    batch = {
         "pixel_values": pixel_values,
         "masks": masks,
         "input_ids": inputs.input_ids,
     }
+    
+    if reference_images is not None:
+        batch["reference_images"] = reference_images
+    if dominant_colors is not None:
+        batch["dominant_colors"] = dominant_colors
+    
+    return batch
 
 
 def main():
@@ -216,8 +238,65 @@ def main():
         except Exception as e:
             logger.warning(f"xformers not available: {e}")
     
-    # Move models to device
+    # Define weight dtype early (needed for IP-Adapter encoder)
     weight_dtype = torch.float16 if config["training"]["mixed_precision"] == "fp16" else torch.float32
+    
+    # ========== IP-ADAPTER INTEGRATION ==========
+    # Load IP-Adapter for reference-based training (following Paint-by-Example approach)
+    ip_adapter_config = config.get("ip_adapter", {})
+    use_ip_adapter = ip_adapter_config.get("enabled", False)
+    ip_adapter_encoder = None
+    
+    if use_ip_adapter:
+        logger.info("Setting up IP-Adapter for training...")
+        
+        # Create temporary pipeline to load IP-Adapter weights into UNet
+        from diffusers import StableDiffusionInpaintPipeline
+        temp_pipe = StableDiffusionInpaintPipeline(
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            unet=unet,
+            scheduler=noise_scheduler,
+            safety_checker=None,
+            feature_extractor=None,
+            requires_safety_checker=False,
+        )
+        
+        # Load IP-Adapter into UNet
+        temp_pipe.load_ip_adapter(
+            ip_adapter_config.get("model_id", "h94/IP-Adapter"),
+            subfolder="models",
+            weight_name=ip_adapter_config.get("weight_name", "ip-adapter-plus_sd15.bin"),
+        )
+        temp_pipe.set_ip_adapter_scale(ip_adapter_config.get("scale", 1.0))
+        
+        # Get the modified UNet with IP-Adapter
+        unet = temp_pipe.unet
+        
+        # Freeze IP-Adapter weights (Sequential Training approach)
+        if ip_adapter_config.get("freeze_weights", True):
+            freeze_ip_adapter_weights(unet)
+            logger.info("IP-Adapter weights frozen - LoRA will learn to collaborate")
+        
+        # Create image encoder for reference images
+        ip_adapter_encoder = IPAdapterImageEncoder(
+            device=str(accelerator.device),
+            dtype=weight_dtype,
+        )
+        ip_adapter_encoder.load()
+        
+        logger.info(f"IP-Adapter enabled with scale={ip_adapter_config.get('scale', 1.0)}")
+        
+        # Clean up temp pipeline (keep UNet)
+        del temp_pipe
+        gc.collect()
+        torch.cuda.empty_cache()
+    else:
+        logger.info("IP-Adapter disabled - training without reference conditioning")
+    # ========== END IP-ADAPTER INTEGRATION ==========
+    
+    # Move models to device (weight_dtype already defined above)
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     
@@ -243,9 +322,14 @@ def main():
         eps=config["training"]["adam_epsilon"],
     )
     
-    # Setup dataset
-    logger.info("Loading dataset...")
-    train_dataset = InpaintingDataset(
+    # Setup dataset with FIXED dominant color extraction
+    # Read reference config (with defaults for backward compatibility)
+    ref_config = config.get("reference", {})
+    logger.info("Loading dataset with hybrid color strategy...")
+    logger.info(f"  Random color prob: {ref_config.get('random_color_prob', 0.0):.0%}")
+    logger.info(f"  Mask erosion: {ref_config.get('mask_erosion_size', 0)}px")
+    
+    train_dataset = WallInpaintingDataset(
         data_root=Path(config["dataset"]["train_data_dir"]).parent,
         split="train",
         resolution=config["dataset"]["resolution"],
@@ -253,6 +337,15 @@ def main():
         random_flip=config["dataset"]["random_flip"],
         quality_threshold=config["dataset"]["quality_threshold"],
         max_samples=args.subset,
+        # Reference image generation config
+        color_extraction_method=ref_config.get("color_extraction_method", "median"),
+        random_color_prob=ref_config.get("random_color_prob", 0.0),
+        color_jitter_prob=ref_config.get("color_jitter_prob", 0.0),
+        color_jitter_range=ref_config.get("color_jitter_range", 10.0),
+        add_reference_texture=ref_config.get("add_reference_texture", True),
+        texture_noise_std=ref_config.get("texture_noise_std", 8.0),
+        add_lighting_gradient=ref_config.get("add_lighting_gradient", True),
+        mask_erosion_size=ref_config.get("mask_erosion_size", 0),
     )
     
     train_dataloader = DataLoader(
@@ -387,19 +480,73 @@ def main():
                 )
                 
                 # Get text embeddings
-                encoder_hidden_states = text_encoder(
-                    batch["input_ids"].to(accelerator.device)
-                )[0].to(weight_dtype)
+                # Check for unconditional training mode (Zero-Prompt strategy)
+                if config["training"].get("unconditional_training", False):
+                    # Use pre-computed unconditional embeddings
+                    encoder_hidden_states = get_unconditional_embedding(
+                        tokenizer, text_encoder, accelerator.device, weight_dtype
+                    ).expand(bsz, -1, -1)
+                else:
+                    # Standard text-conditioned training
+                    encoder_hidden_states = text_encoder(
+                        batch["input_ids"].to(accelerator.device)
+                    )[0].to(weight_dtype)
                 
                 # Predict noise
+                # If IP-Adapter is enabled, encode reference images and pass to UNet
+                added_cond_kwargs = None
+                if use_ip_adapter and ip_adapter_encoder is not None:
+                    # Get reference images from batch
+                    if "reference_images" in batch:
+                        ref_images = batch["reference_images"].to(accelerator.device, dtype=weight_dtype)
+                        # Encode reference images
+                        image_embeds = ip_adapter_encoder.encode_batch(ref_images)
+                        added_cond_kwargs = {"image_embeds": image_embeds}
+                
                 noise_pred = unet(
                     latent_model_input,
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
+                    added_cond_kwargs=added_cond_kwargs,
                 ).sample
                 
-                # Calculate loss
-                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                # Calculate loss (noise prediction loss)
+                noise_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                
+                # Optional: Color consistency loss
+                color_loss_config = config.get("color_loss", {})
+                use_color_loss = color_loss_config.get("enabled", False)
+                color_loss = torch.tensor(0.0, device=accelerator.device)
+                
+                if use_color_loss and global_step >= color_loss_config.get("start_step", 0):
+                    # Decode predicted clean latents to compute color loss
+                    # x0_pred = (noisy_latents - sqrt(1-alpha) * noise_pred) / sqrt(alpha)
+                    alpha_t = noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1).to(noisy_latents.device)
+                    x0_pred = (noisy_latents - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
+                    
+                    # Decode to image space (with gradient)
+                    with torch.cuda.amp.autocast(enabled=False):
+                        decoded = vae.decode(x0_pred.float() / vae.config.scaling_factor).sample
+                    
+                    # Compute color loss on masked region (LAB space approximation)
+                    if "dominant_colors" in batch:
+                        target_colors = batch["dominant_colors"].to(accelerator.device).float() / 255.0  # [B, 3] in [0,1]
+                        target_colors = target_colors * 2 - 1  # [0,1] -> [-1,1]
+                        
+                        # Expand to match image size
+                        target_expanded = target_colors.view(-1, 3, 1, 1).expand_as(decoded)
+                        
+                        # Apply mask
+                        mask_expanded = F.interpolate(batch["masks"], size=decoded.shape[-2:], mode="nearest")
+                        masked_decoded = decoded * mask_expanded
+                        masked_target = target_expanded * mask_expanded
+                        
+                        # Color loss in masked region
+                        color_loss = F.mse_loss(masked_decoded, masked_target)
+                
+                # Total loss
+                color_weight = color_loss_config.get("weight", 0.1)
+                loss = noise_loss + color_weight * color_loss
                 
                 # Backprop
                 accelerator.backward(loss)
@@ -475,13 +622,46 @@ def main():
     logger.info("Training complete!")
 
 
+def get_unconditional_embedding(tokenizer, text_encoder, device, dtype):
+    """
+    Generate the unconditional embedding (empty prompt).
+    This is used for "Zero-Prompt" training to force reliance on image conditioning.
+    """
+    uncond_tokens = tokenizer(
+        [""],  # Empty prompt
+        max_length=tokenizer.model_max_length,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        uncond_embeddings = text_encoder(
+            uncond_tokens.input_ids.to(device)
+        )[0].to(dtype)
+    return uncond_embeddings  # Shape: [1, 77, 768]
+
+
 def generate_validation_samples(
     accelerator, unet, vae, text_encoder, tokenizer,
     noise_scheduler, config, output_dir, global_step, weight_dtype
 ):
-    """Generate validation samples during training using real validation data."""
+    """
+    Generate comprehensive validation with configurable samples and full input/output grids.
+    
+    Creates multi-column grids: Source | Reference | Mask | Segment | Depth | Output
+    Computes color fidelity metrics in LAB/HSV space.
+    """
     try:
-        # Create a simple pipeline for inference
+        num_samples = config["validation"].get("num_validation_samples", 50)
+        
+        # Initialize visualizer
+        visualizer = ValidationVisualizer(
+            output_dir=output_dir,
+            resolution=config["dataset"]["resolution"],
+            num_samples=num_samples,
+        )
+        
+        # Create pipeline for inference
         pipeline = StableDiffusionInpaintPipeline(
             vae=vae,
             text_encoder=text_encoder,
@@ -494,58 +674,90 @@ def generate_validation_samples(
         )
         pipeline.set_progress_bar_config(disable=True)
         
-        # Load validation examples
-        val_dir = output_dir / "validation_samples"
-        val_dir.mkdir(exist_ok=True)
-        
-        # Helper to load dataset samples
-        val_dataset_path = Path(config["dataset"]["train_data_dir"]).parent / "validation"
-        val_dataset = InpaintingDataset(
+        # Load validation dataset with FIXED dominant color extraction
+        val_dataset = WallInpaintingDataset(
             data_root=Path(config["dataset"]["train_data_dir"]).parent,
             split="validation",
             resolution=config["dataset"]["resolution"],
-            max_samples=4
+            max_samples=num_samples,
+            color_extraction_method="median",
+            add_reference_texture=True,
         )
         
         generator = torch.Generator(device=accelerator.device).manual_seed(42)
+        samples = []
+        all_metrics = []
         
-        logger.info(f"Generating {len(val_dataset)} validation samples...")
+        actual_samples = min(num_samples, len(val_dataset))
+        logger.info(f"Generating {actual_samples} validation samples...")
         
-        for i in range(min(4, len(val_dataset))):
-            sample = val_dataset[i]
+        for i in range(actual_samples):
+            sample_data = val_dataset[i]
             
-            # Prepare inputs (convert back from tensor for pipeline)
-            # Tensor is [-1, 1], convert to PIL [0, 255]
-            image_tensor = sample["pixel_values"]
-            image_np = ((image_tensor.permute(1, 2, 0).cpu().numpy() + 1) * 127.5).astype(np.uint8)
-            val_image = Image.fromarray(image_np)
+            # Convert tensors to PIL
+            source_image = tensor_to_pil(sample_data["pixel_values"])
+            mask_image = mask_tensor_to_pil(sample_data["mask"])
+            prompt = sample_data.get("caption", "")
             
-            # Mask tensor is [1, H, W], convert to PIL L
-            mask_tensor = sample["mask"]
-            mask_np = (mask_tensor.squeeze().cpu().numpy() * 255).astype(np.uint8)
-            val_mask = Image.fromarray(mask_np, mode="L")
+            # FIXED: Use solid color reference from dominant color extraction
+            dominant_color = tuple(sample_data["dominant_color"].tolist())
+            reference_image = dominant_color_to_pil(dominant_color, size=(512, 512))
             
-            prompt = sample["caption"]
+            # Depth map placeholder (add depth estimation if available)
+            depth_map = None
             
+            # Run inference with empty prompt for Zero-Prompt strategy
+            inference_prompt = "" if config["training"].get("unconditional_training", False) else prompt
             with torch.autocast("cuda"):
                 result = pipeline(
-                    prompt=prompt,
-                    image=val_image,
-                    mask_image=val_mask,
+                    prompt=inference_prompt,
+                    image=source_image,
+                    mask_image=mask_image,
                     num_inference_steps=20,
                     generator=generator,
                 ).images[0]
             
-            # Save grid: Original | Mask | Result
-            w, h = val_image.size
-            grid = Image.new("RGB", (w * 3, h))
-            grid.paste(val_image, (0, 0))
-            grid.paste(val_mask.convert("RGB"), (w, 0))
-            grid.paste(result, (w * 2, 0))
+            # Create segment overlay
+            segment_overlay = create_segment_overlay(source_image, mask_image)
             
-            grid.save(val_dir / f"step_{global_step}_sample_{i}.png")
+            # Compute color fidelity metrics (reference is solid color now)
+            metrics = compute_color_fidelity_metrics(reference_image, result, mask_image)
+            all_metrics.append(metrics)
+            
+            # Create sample object
+            samples.append(ValidationSample(
+                source_image=source_image,
+                reference_image=reference_image,
+                mask=mask_image,
+                segment_overlay=segment_overlay,
+                depth_map=depth_map,
+                model_output=result,
+                prompt=prompt,
+                sample_id=i,
+            ))
         
-        logger.info(f"Saved validation samples to {val_dir}")
+        # Create comparison sheets (10 samples per sheet)
+        saved_paths = visualizer.create_comparison_sheet(samples, global_step, samples_per_sheet=10)
+        
+        # Aggregate metrics
+        if all_metrics:
+            avg_metrics = {
+                f"val/{k}_mean": float(np.mean([m[k] for m in all_metrics]))
+                for k in all_metrics[0].keys()
+            }
+            
+            # Log to accelerator
+            accelerator.log(avg_metrics, step=global_step)
+            
+            # Save metrics file
+            visualizer.log_metrics(samples, global_step, avg_metrics)
+            
+            logger.info(
+                f"Color metrics: LAB={avg_metrics.get('val/lab_distance_mean', 0):.2f}, "
+                f"Hue={avg_metrics.get('val/hue_error_mean', 0):.2f}"
+            )
+        
+        logger.info(f"Saved {len(saved_paths)} validation sheets to {visualizer.output_dir}")
         
     except Exception as e:
         logger.warning(f"Validation failed: {e}")

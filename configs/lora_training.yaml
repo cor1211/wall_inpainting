@@ -21,8 +21,29 @@ dataset:
   resolution: 512
   center_crop: true
   random_flip: true
-  quality_threshold: 0.5          # Minimum quality score
+  quality_threshold: 0.6          # Increased to filter noisy masks (was 0.5)
   dataloader_num_workers: 4
+
+# Reference Image Generation (NEW - for color fidelity)
+reference:
+  # Color extraction method: "median" (robust), "mean" (fast), "kmeans" (accurate but slow)
+  color_extraction_method: "median"
+  
+  # HYBRID STRATEGY: Mix extracted colors with random colors
+  # 0.0 = only extracted (realistic), 1.0 = only random (maximum generalization)
+  random_color_prob: 0.3          # 30% random, 70% extracted (recommended)
+  
+  # Color jitter for data augmentation
+  color_jitter_prob: 0.2          # 20% chance of slight color variation
+  color_jitter_range: 15.0        # Max LAB space jitter
+  
+  # Texture for CLIP feature extraction
+  add_reference_texture: true
+  texture_noise_std: 8.0
+  add_lighting_gradient: true
+  
+  # Mask erosion to reduce segmentation noise
+  mask_erosion_size: 5            # Kernel size (0 = disabled, 5-7 recommended)
 
 training:
   # Batch settings (optimal for 12GB VRAM - RTX 3060 Ti)
@@ -59,15 +80,20 @@ training:
   
   # Reproducibility
   seed: 42
+  
+  # Zero-Prompt Strategy: Set to true to remove text prompts and force
+  # the model to rely solely on image conditioning (IP-Adapter, mask, depth)
+  unconditional_training: true   # Enable for color fidelity experiment
 
 checkpointing:
   output_dir: "lora_checkpoints"
   checkpointing_steps: 1000
-  resume_from_checkpoint: null    # Path to resume from
+  resume_from_checkpoint: /mnt/data1tb/vinh/wall_inpainting/lora_checkpoints/checkpoint-2000    # Path to resume from
   
 validation:
   validation_steps: 500           # Generate samples every N steps
-  num_validation_samples: 4
+  num_validation_samples: 50      # Increased for rigorous color fidelity assessment
+  samples_per_sheet: 10           # Number of samples per validation grid sheet
   validation_prompts:
     - "interior room with beige walls, professional photography"
     - "a room with terracotta painted walls, modern interior"
@@ -79,3 +105,20 @@ logging:
   logging_dir: "logs"
   log_with_wandb: false
   wandb_project: "wall-inpainting-lora"
+
+# ========== IP-ADAPTER INTEGRATION (NEW) ==========
+# Following Paint-by-Example and AnyDoor approach:
+# Train LoRA with IP-Adapter ACTIVE (but FROZEN) so LoRA learns to use reference
+ip_adapter:
+  enabled: true                   # Enable IP-Adapter during training
+  model_id: "h94/IP-Adapter"      # IP-Adapter model ID
+  weight_name: "ip-adapter_sd15.bin"  # Standard IP-Adapter (ViT-L/14, 768 dim)
+  scale: 1.0                      # Full strength reference conditioning
+  freeze_weights: true            # IMPORTANT: Freeze IP-Adapter, only train LoRA
+
+# Optional: Color Consistency Loss
+# Adds explicit color matching loss on masked region
+color_loss:
+  enabled: true                   # Enable color loss
+  weight: 0.1                     # Weight relative to noise loss
+  start_step: 500                 # Start applying after model converges basic
