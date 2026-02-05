@@ -97,12 +97,12 @@ class WallReskinPipeline:
             safety_checker=None,
         )
         
-        # 3. Load IP-Adapter (For Style/Color Transfer)
-        print("  Loading IP-Adapter...")
+        # 3. Load IP-Adapter Plus (better for color/style transfer)
+        print("  Loading IP-Adapter Plus...")
         self._pipe.load_ip_adapter(
             self.ip_adapter_model_id, 
             subfolder="models", 
-            weight_name="ip-adapter_sd15.bin"
+            weight_name="ip-adapter-plus_sd15.bin"
         )
         self._pipe.set_ip_adapter_scale(0.7)  # Default scale
         
@@ -236,13 +236,13 @@ class WallReskinPipeline:
         source_image: Union[str, Path, Image.Image],
         mask_image: Union[str, Path, Image.Image],
         reference_image: Union[str, Path, Image.Image],
-        prompt: str = "high quality wall, interior design, photorealistic",
-        negative_prompt: str = "blurry, low quality, artifacts, distortion, furniture changes, people",
+        prompt: str = "",  # Empty prompt to let IP-Adapter fully control color
+        negative_prompt: str = "blurry, low quality, artifacts, distortion",
         num_inference_steps: int = 30,
         controlnet_conditioning_scale: float = 0.8,
-        ip_adapter_scale: float = 0.7,
+        ip_adapter_scale: float = 1.0,  # Maximum IP-Adapter influence for color transfer
         strength: float = 0.99,
-        guidance_scale: float = 7.5,
+        guidance_scale: float = 5.0,  # Balanced for color transfer
         seed: Optional[int] = None,
         output_size: Tuple[int, int] = (512, 512),
     ) -> Image.Image:
@@ -349,18 +349,40 @@ class WallReskinPipeline:
 def create_solid_color_reference(
     color: Tuple[int, int, int],
     size: Tuple[int, int] = (224, 224),
+    add_texture: bool = True,
 ) -> Image.Image:
     """
-    Create a solid color reference image for IP-Adapter.
+    Create a color reference image for IP-Adapter.
     
     Args:
         color: RGB color tuple (0-255).
         size: Image size.
+        add_texture: If True, add subtle noise/texture to help CLIP extract features.
+                     Pure solid colors can break CLIP vision model.
         
     Returns:
-        Solid color PIL Image.
+        Color reference PIL Image.
     """
-    return Image.new("RGB", size, color)
+    img = Image.new("RGB", size, color)
+    
+    if add_texture:
+        # Add subtle noise to help CLIP extract meaningful features
+        # Pure solid colors don't give CLIP enough information
+        arr = np.array(img, dtype=np.float32)
+        
+        # Add gaussian noise (subtle variation)
+        noise = np.random.normal(0, 8, arr.shape)  # Slight noise
+        arr = np.clip(arr + noise, 0, 255)
+        
+        # Add very subtle gradient to simulate lighting variation
+        h, w = size[1], size[0]
+        gradient = np.linspace(0.95, 1.05, h).reshape(-1, 1, 1)
+        gradient = np.tile(gradient, (1, w, 3))
+        arr = np.clip(arr * gradient, 0, 255).astype(np.uint8)
+        
+        img = Image.fromarray(arr)
+    
+    return img
 
 
 def create_gradient_reference(

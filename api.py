@@ -241,7 +241,7 @@ async def process_image(
     strategy: str = Form("semantic", description="Segmentation strategy"),
     steps: int = Form(30, description="Number of inference steps"),
     controlnet_scale: float = Form(0.8, description="ControlNet scale (0-1)"),
-    ip_scale: float = Form(0.7, description="IP-Adapter scale (0-1)"),
+    ip_scale: float = Form(1.0, description="IP-Adapter scale (1.0 for maximum color transfer)"),
     seed: Optional[int] = Form(None, description="Random seed"),
 ):
     """
@@ -316,7 +316,7 @@ async def process_with_color(
     strategy: str = Form("semantic", description="Segmentation strategy"),
     steps: int = Form(30, description="Number of inference steps"),
     controlnet_scale: float = Form(0.8, description="ControlNet scale"),
-    ip_scale: float = Form(0.7, description="IP-Adapter scale"),
+    ip_scale: float = Form(1.0, description="IP-Adapter scale (1.0 for maximum color transfer)"),
     seed: Optional[int] = Form(None, description="Random seed"),
 ):
     """

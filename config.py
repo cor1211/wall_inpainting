@@ -54,17 +54,17 @@ class PipelineConfig:
     # Generation parameters
     num_inference_steps: int = 30
     controlnet_conditioning_scale: float = 0.8
-    ip_adapter_scale: float = 0.7
+    ip_adapter_scale: float = 1.0  # Maximum for better color transfer
     strength: float = 0.99
-    guidance_scale: float = 7.5
+    guidance_scale: float = 5.0  # Balanced: not too high (color bias), not too low (weak transfer)
     
     # Image sizes
     output_size: Tuple[int, int] = (512, 512)
     reference_size: Tuple[int, int] = (224, 224)
     
-    # Prompts
-    default_prompt: str = "high quality wall, interior design, photorealistic"
-    default_negative_prompt: str = "blurry, low quality, artifacts, distortion, furniture changes, people"
+    # Prompts (empty to let IP-Adapter control color)
+    default_prompt: str = ""
+    default_negative_prompt: str = "blurry, low quality, artifacts, distortion"
     
     # Optimization
     enable_cpu_offload: bool = True
@@ -75,8 +75,8 @@ class PipelineConfig:
 class LoRAConfig:
     """Configuration for LoRA adapters."""
     
-    # Enable LoRA loading
-    enabled: bool = True
+    # Enable LoRA loading (DISABLED - LoRA has color bias from training dataset)
+    enabled: bool = False
     
     # Default LoRA checkpoint path
     default_path: str = "lora_checkpoints"
