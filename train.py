@@ -33,18 +33,17 @@ from models.wall_recoloring_pipeline import get_wall_recoloring_pipeline
 def validate_and_save(accelerator, unet, controlnet, vae, text_encoder, tokenizer, image_encoder, val_dataloader, global_step, weight_dtype, output_dir):
     """
     Validation step: Generate images using the trained UNet.
+    
+    Validation follows the same pipeline as inference:
+    - Input: Random noise latents
+    - Conditions: Source image (ControlNet), Color reference (IP-Adapter), Mask (Inpainting)
+    - Output: Generated image with new wall color
     """
     if not accelerator.is_local_main_process:
         return
         
     unet.eval()
     print(f"\nRunning Validation at Step {global_step}...")
-    
-    # We need to construct a pipeline manually or use the components
-    # Easier to just run the manual generation loop for a few samples
-    # Or instantiate a temporary pipeline?
-    # Instantiating pipeline is cleaner but heavy.
-    # Let's run manual loop for 1 batch.
     
     val_dir = os.path.join(output_dir, "validation_images")
     os.makedirs(val_dir, exist_ok=True)
@@ -54,8 +53,7 @@ def validate_and_save(accelerator, unet, controlnet, vae, text_encoder, tokenize
     resolution = 512
     device = accelerator.device
     
-    # We need a scheduler config. Use DDIMScheduler compatible with SD1.5
-    # The training used DDPMScheduler. 
+    # Use DDIMScheduler for faster inference
     val_scheduler = DDIMScheduler.from_pretrained("runwayml/stable-diffusion-inpainting", subfolder="scheduler")
     
     try:
@@ -63,7 +61,7 @@ def validate_and_save(accelerator, unet, controlnet, vae, text_encoder, tokenize
     except StopIteration:
         return
 
-    # Use max 2 samples
+    # Use max 2 samples for validation
     if batch['color_patches'].shape[0] > 2:
         for k in batch:
             if isinstance(batch[k], torch.Tensor) or isinstance(batch[k], list):
@@ -71,67 +69,78 @@ def validate_and_save(accelerator, unet, controlnet, vae, text_encoder, tokenize
     
     bsz = batch['color_patches'].shape[0]
     
-    # 1. Prepare Latents (Noise)
-    # UNet inpainting has 9 channels, but base latents are 4.
-    latents = torch.randn(
-        (bsz, 4, resolution // 8, resolution // 8),
-        device=device,
-        dtype=weight_dtype
-    )
-    
-    # 2. Text Embeds
     with torch.no_grad():
-        inputs = tokenizer(batch["prompts"], max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt")
+        # 1. Prepare Latents (Random Noise - Start from scratch)
+        latents = torch.randn(
+            (bsz, 4, resolution // 8, resolution // 8),
+            device=device,
+            dtype=weight_dtype
+        )
+        
+        # 2. Text Embeddings
+        inputs = tokenizer(
+            batch["prompts"], 
+            max_length=tokenizer.model_max_length, 
+            padding="max_length", 
+            truncation=True, 
+            return_tensors="pt"
+        )
         encoder_hidden_states = text_encoder(inputs.input_ids.to(device))[0]
         
-        # 3. ControlNet Cond
+        # 3. ControlNet Condition: Use SOURCE image (old wall) for structure preservation
+        # conditional_images is already preprocessed (depth/canny) from dataset
         control_images = batch["conditional_images"].to(device, dtype=weight_dtype)
+        # Convert to [-1, 1] if needed (ControlNet expects normalized)
+        if control_images.max() <= 1.0:
+            control_images = control_images * 2.0 - 1.0
         
-        # 4. IP-Adapter Embeds
+        # 4. IP-Adapter: Use COLOR REFERENCE (new color) for color transfer
         pixel_values_ip = batch["color_patches"].to(device, dtype=weight_dtype)
         
-        # Resize to 224x224 for CLIP
-        pixel_values_ip = F.interpolate(pixel_values_ip, size=(224, 224), mode="bilinear", align_corners=False)
+        # Resize to 224x224 for CLIP (if not already)
+        if pixel_values_ip.shape[2] != 224:
+            pixel_values_ip = F.interpolate(pixel_values_ip, size=(224, 224), mode="bilinear", align_corners=False)
         
-        # Norm
+        # Normalize for CLIP Vision Encoder
         mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).to(device, dtype=weight_dtype).view(1, 3, 1, 1)
         std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).to(device, dtype=weight_dtype).view(1, 3, 1, 1)
         pixel_values_ip = (pixel_values_ip - mean) / std
-        image_embeds = image_encoder(pixel_values_ip).image_embeds
+        # Encode color reference to image embeddings (IP-Adapter Plus uses hidden states)
+        image_encoder_output = image_encoder(pixel_values_ip, output_hidden_states=True)
+        image_embeds = image_encoder_output.hidden_states[-2] # (B, SeqLen, 1280)
         added_cond_kwargs = {"image_embeds": image_embeds}
 
-        # 5. Inpainting Setup
-        
-        # Masked Source
+        # 5. Inpainting Setup: Use SOURCE image (old wall) for masked source
+        # This preserves the non-wall regions while generating new wall color
         masked_source_pixel = batch["masked_sources"].to(device, dtype=weight_dtype) * 2.0 - 1.0
         masked_latents = vae.encode(masked_source_pixel).latent_dist.sample() * vae.config.scaling_factor
         
-        # Mask
-        mask = batch["masks"].to(device, dtype=weight_dtype).unsqueeze(1)
+        # Mask: Resize to latent size
+        mask = batch["mask"].to(device, dtype=weight_dtype)
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1)  # Add channel dimension if needed
         mask_latents = F.interpolate(mask, size=latents.shape[2:], mode="nearest")
         
+        # Set timesteps for denoising
         val_scheduler.set_timesteps(20)
         timesteps = val_scheduler.timesteps
         
-        # Use autocast for mixed precision inference logic
+        # Denoising loop
         with accelerator.autocast():
             for t in timesteps:
-                # Expand latents for conditional/unconditional (here supervised, so just 1)
-                latent_model_input = latents
+                # Concatenate Inpainting inputs: [noisy_latents, mask, masked_source_latents]
+                unet_input = torch.cat([latents, mask_latents, masked_latents], dim=1)
                 
-                # Concatenate Inpainting inputs
-                unet_input = torch.cat([latent_model_input, mask_latents, masked_latents], dim=1)
-                
-                # ControlNet
+                # ControlNet: Preserve structure from source image
                 down_block_res_samples, mid_block_res_sample = controlnet(
-                    latent_model_input,
+                    latents,
                     t,
                     encoder_hidden_states=encoder_hidden_states,
                     controlnet_cond=control_images,
                     return_dict=False,
                 )
                 
-                # UNet
+                # UNet: Predict noise with all conditions
                 noise_pred = unet(
                     unet_input,
                     t,
@@ -141,22 +150,22 @@ def validate_and_save(accelerator, unet, controlnet, vae, text_encoder, tokenize
                     added_cond_kwargs=added_cond_kwargs
                 ).sample
                 
-                # Step
+                # Denoising step
                 latents = val_scheduler.step(noise_pred, t, latents).prev_sample
             
-        # Decode
+        # Decode latents to image
         latents = 1 / vae.config.scaling_factor * latents
         latents = latents.to(weight_dtype)
         image = vae.decode(latents).sample
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.cpu().permute(0, 2, 3, 1).numpy()
         
-        # Save
-        from PIL import Image
+        # Save validation images
+        from PIL import Image as PILImage
         import numpy as np
         for i in range(bsz):
             img = (image[i] * 255).astype(np.uint8)
-            Image.fromarray(img).save(os.path.join(val_dir, f"step_{global_step}_sample_{i}.png"))
+            PILImage.fromarray(img).save(os.path.join(val_dir, f"step_{global_step}_sample_{i}.png"))
             
     print(f"Saved validation images to {val_dir}")
     unet.train()
@@ -168,7 +177,7 @@ def main():
     parser.add_argument("--validation_json", type=str, default="dataset_v2/validation/metadata.jsonl")
     parser.add_argument("--output_dir", type=str, default="output/wall_recolor_v1")
     parser.add_argument("--base_model", type=str, default="runwayml/stable-diffusion-inpainting")
-    parser.add_argument("--controlnet_model", type=str, default="lllyasviel/control_v11p_sd15_canny")
+    parser.add_argument("--controlnet_model", type=str, default="lllyasviel/control_v11f1p_sd15_depth")
     parser.add_argument("--ip_adapter_scale", type=float, default=0.6)
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--train_batch_size", type=int, default=4)
@@ -291,11 +300,17 @@ def main():
         weight_decay=1e-2
     )
     
+
+    
     # 4. Dataset
+    # Use Depth for ControlNet (better structure preservation)
     train_dataset = WallPaintDataset(
         data_json=args.data_json,
         image_size=args.resolution,
-        reconstruction_ratio=0.5
+        reconstruction_ratio=0.0,  # Always use target (new color) as GT, not source
+        use_depth=True,  # Use depth map for ControlNet
+        use_canny=False,
+        random_flip=True
     )
     
     train_dataloader = torch.utils.data.DataLoader(
@@ -308,11 +323,22 @@ def main():
         persistent_workers=False
     )
 
+    # Learning Rate Scheduler (Must be after DataLoader to know length)
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=len(train_dataloader) * args.num_train_epochs // args.gradient_accumulation_steps,
+    )
+
     # Validation Set
     val_dataset = WallPaintDataset(
         data_json=args.validation_json,
         image_size=args.resolution,
-        reconstruction_ratio=0.5
+        reconstruction_ratio=0.0,  # Always use target (new color) as GT
+        use_depth=True,  # Use depth map for ControlNet
+        use_canny=False,
+        random_flip=False  # No augmentation for validation
     )
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset,
@@ -326,10 +352,10 @@ def main():
 
     
     # Prepare with Accelerator
-    # Only prepare UNet, Optimizer, TrainDataloader. 
+    # Only prepare UNet, Optimizer, TrainDataloader, LR Scheduler. 
     # ValDataloader is manually iterated.
-    unet, optimizer, train_dataloader = accelerator.prepare(
-        unet, optimizer, train_dataloader
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler
     )
     
     # Iterate
@@ -367,147 +393,218 @@ def main():
     # This is exactly "Phase 2" logic: Train UNet (LoRA) to coordinate, keep Adapters frozen.
     
     print("Starting Training...")
+    print("=" * 80)
+    print("TRAINING STRATEGY:")
+    print("  - Input (noisy): TARGET image (new wall color) - This is the key!")
+    print("  - Conditions:")
+    print("    * ControlNet: SOURCE image (old wall) for structure preservation")
+    print("    * IP-Adapter: COLOR REFERENCE (new color) for color transfer")
+    print("    * Masked Source: SOURCE image (old wall) for inpainting context")
+    print("  - Target (GT): TARGET image (new wall color)")
+    print("=" * 80)
     
     for epoch in range(args.num_train_epochs):
         unet.train()
-        for batch in tqdm(train_dataloader, disable=not accelerator.is_local_main_process):
+        progress_bar = tqdm(train_dataloader, disable=not accelerator.is_local_main_process)
+        
+        for batch in progress_bar:
             with accelerator.accumulate(unet):
-                # 1. Inputs
-                # batch keys: ['color_patches', 'masked_sources', 'targets', 'conditional_images', 'masks', 'prompts']
+                # ====================================================================
+                # PHASE 1: PREPARE TARGET LATENTS (Ground Truth)
+                # ====================================================================
+                # Dataset returns: source, target, mask, color_patches, 
+                #                  conditional_images, masked_sources, prompts
+                # 
+                # Training Strategy: Use TARGET image (new wall color) as GT
+                # This teaches the model to generate new colors, not reconstruct old ones
                 
-                # Convert images to latent space
-                # Inputs are already normalized to [0,1] floating point in Dataset?
-                # Check Dataset: .float() / 255.0. Yes.
-                # VAE expects usually [-1, 1].
-                # Let's normalize.
+                target_pixel_values = batch["target"].to(dtype=weight_dtype)  # [B, 3, H, W] (0-1)
+                target_pixel_values_normalized = target_pixel_values * 2.0 - 1.0  # [-1, 1] for VAE
                 
-                # Target (GT) -> Latents
-                pixel_values = batch["targets"].to(dtype=weight_dtype) * 2.0 - 1.0
-                latents = vae.encode(pixel_values).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
+                # Encode TARGET image to latent space (this is our GT)
+                with torch.no_grad():
+                    target_latents = vae.encode(target_pixel_values_normalized).latent_dist.sample()
+                    target_latents = target_latents * vae.config.scaling_factor  # [B, 4, 64, 64]
                 
-                # Noise
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
+                # ====================================================================
+                # PHASE 2: ADD NOISE TO TARGET (Diffusion Forward Process)
+                # ====================================================================
+                # Sample random noise and timestep
+                noise = torch.randn_like(target_latents)  # ε ~ N(0, I) - This is the GT for loss
+                bsz = target_latents.shape[0]
+                timesteps = torch.randint(
+                    0, 
+                    noise_scheduler.config.num_train_timesteps, 
+                    (bsz,), 
+                    device=target_latents.device
+                ).long()
                 
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                # Add noise to TARGET latents: z_t = √(α_t) * z_0 + √(1-α_t) * ε
+                noisy_latents = noise_scheduler.add_noise(target_latents, noise, timesteps)
                 
-                # 2. Conditioning
+                # ====================================================================
+                # PHASE 3: PREPARE CONDITIONS
+                # ====================================================================
                 
-                # A. Text
-                inputs = tokenizer(batch["prompts"], max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt")
+                # A. Text Embeddings
+                inputs = tokenizer(
+                    batch["prompts"], 
+                    max_length=tokenizer.model_max_length, 
+                    padding="max_length", 
+                    truncation=True, 
+                    return_tensors="pt"
+                )
                 encoder_hidden_states = text_encoder(inputs.input_ids.to(accelerator.device))[0]
                 
-                # B. ControlNet (Source Image)
-                control_images = batch["conditional_images"].to(dtype=weight_dtype) # [0, 1] is fine for ControlNet
-                # Get ControlNet output
+                # B. ControlNet Condition: Use SOURCE image (old wall) for structure
+                # conditional_images is depth map (or canny) preprocessed from SOURCE image
+                control_images = batch["conditional_images"].to(dtype=weight_dtype)  # [B, 3, H, W] (0-1)
+                # Convert to [-1, 1] for ControlNet
+                control_images_normalized = control_images * 2.0 - 1.0
+                
+                # ControlNet forward: Preserve structure from source image
                 down_block_res_samples, mid_block_res_sample = controlnet(
-                    noisy_latents,
+                    noisy_latents,  # Use noisy TARGET latents
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
-                    controlnet_cond=control_images,
+                    controlnet_cond=control_images_normalized,  # Depth/canny from SOURCE
                     return_dict=False,
                 )
                 
-                # C. IP-Adapter (Color Patch)
-                # The IP-Adapter logic is embedded in the UNet. We need to pass the image embeddings.
-                # In diffusers `StableDiffusionPipeline`, `ip_adapter_image` creates `image_embeds`.
-                # We need to manually extract image embeds and pass to UNet `added_cond_kwargs` or `encoder_hidden_states`?
-                # Diffusers implementation of IP-Adapter stores embeds in `unet.encoder_hidden_states` via concatenation?
-                # No, standard IP-Adapter passes `image_embeds` to the attention processor.
-                # BUT `unet` forward() signature doesn't standardly accept `image_embeds`.
-                # The `StableDiffusionPipeline` hacks this via `added_cond_kwargs` for SDXL, or by modifying attention processors.
-                # When we called `pipe.load_ip_adapter`, it replaced attention processors.
-                # These processors EXPECT `image_embeds` passed implicitly or via a side channel?
-                # Actually, diffusers implementation usually expects `added_cond_kwargs` with `image_embeds`.
+                # C. IP-Adapter Condition: Use COLOR REFERENCE (new color) for color transfer
+                # color_patches is already [B, 3, 224, 224] (0-1) from dataset
+                pixel_values_ip = batch["color_patches"].to(dtype=weight_dtype)
                 
-                # Let's encode image
-                # CLIPVision expects preprocessed images. Dataset gives raw tensors.
-                # We need a CLIPImageProcessor equivalent.
-                # Simple resize/norm usually sufficient or use `CLIPImageProcessor` if strictly needed.
-                # For now assume dataset `color_patches` (0-1) are close enough, just normalize to CLIP expected.
-                # CLIP mean/std: [0.481, 0.457, 0.408], [0.268, 0.261, 0.275]
-                # Dataset output is [0, 1].
-                from transformers import CLIPImageProcessor
-                clip_image_processor = CLIPImageProcessor()
-                # We need to convert back to list of numpy or use tensors?
-                # Processor accepts tensors too.
-                # batch["color_patches"] is (B, 3, H, W).
-                # This might slow down training.
-                # Let's assume we pass raw tensors to image_encoder if it accepts it.
-                # CLIPVisionModel expects pixel_values.
+                # Ensure size is 224x224 (should already be from dataset)
+                if pixel_values_ip.shape[2] != 224 or pixel_values_ip.shape[3] != 224:
+                    pixel_values_ip = F.interpolate(
+                        pixel_values_ip, 
+                        size=(224, 224), 
+                        mode="bilinear", 
+                        align_corners=False
+                    )
                 
-                pixel_values_ip = batch["color_patches"].to(dtype=weight_dtype) 
+                # Normalize for CLIP Vision Encoder
+                mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).to(
+                    device=accelerator.device, 
+                    dtype=weight_dtype
+                ).view(1, 3, 1, 1)
+                std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).to(
+                    device=accelerator.device, 
+                    dtype=weight_dtype
+                ).view(1, 3, 1, 1)
+                pixel_values_ip_normalized = (pixel_values_ip - mean) / std
                 
-                # Resize to 224x224 for CLIP
-                pixel_values_ip = F.interpolate(pixel_values_ip, size=(224, 224), mode="bilinear", align_corners=False)
+                # Encode color reference to image embeddings
+                # IP-Adapter Plus expects hidden states from penultimate layer, NOT pooled embeds
+                image_encoder_output = image_encoder(pixel_values_ip_normalized, output_hidden_states=True)
+                image_embeds = image_encoder_output.hidden_states[-2]  # [B, 257, 1280]
+                added_cond_kwargs = {"image_embeds": image_embeds}
                 
-                # Need proper normalization for CLIP
-                # (val - mean) / std
-                mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).to(device=accelerator.device, dtype=weight_dtype).view(1, 3, 1, 1)
-                std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).to(device=accelerator.device, dtype=weight_dtype).view(1, 3, 1, 1)
-                pixel_values_ip = (pixel_values_ip - mean) / std
+                # ====================================================================
+                # PHASE 4: PREPARE INPAINTING INPUTS
+                # ====================================================================
+                # For inpainting, we need: [noisy_latents, mask, masked_source_latents]
+                # 
+                # Important: Use SOURCE image (old wall) for masked_source, not target!
+                # This preserves the non-wall regions while generating new wall color
                 
-                image_embeds = image_encoder(pixel_values_ip).image_embeds # (B, 1024)
+                masked_source_pixel = batch["masked_sources"].to(dtype=weight_dtype)  # [B, 3, H, W] (0-1)
+                masked_source_pixel_normalized = masked_source_pixel * 2.0 - 1.0  # [-1, 1]
                 
-                # Correct way for modern Diffusers (>=0.27):
-                # IP-Adapter expects `added_cond_kwargs={"image_embeds": ...}`
-                # IMPORTANT: Do NOT wrap in list if only one adapter.
-                added_cond_kwargs = {"image_embeds": image_embeds} 
+                with torch.no_grad():
+                    masked_latents = vae.encode(masked_source_pixel_normalized).latent_dist.sample()
+                    masked_latents = masked_latents * vae.config.scaling_factor  # [B, 4, 64, 64]
                 
-                # 3. Model Prediction
-                # SD Inpainting expects concatenated input: [noisy_latents, mask, masked_image_latents]
-                # Encode Masked Source
-                masked_source_pixel = batch["masked_sources"].to(dtype=weight_dtype) * 2.0 - 1.0
-                masked_latents = vae.encode(masked_source_pixel).latent_dist.sample() * vae.config.scaling_factor
+                # Resize mask to latent size
+                mask = batch["mask"].to(dtype=weight_dtype)  # [B, 1, H, W] (0-1)
+                if mask.dim() == 3:
+                    mask = mask.unsqueeze(1)  # Add channel dim if needed
+                mask_latents = F.interpolate(
+                    mask, 
+                    size=target_latents.shape[2:], 
+                    mode="nearest"
+                )  # [B, 1, 64, 64]
                 
-                # Resize Mask to latent size
-                mask = batch["masks"].to(dtype=weight_dtype).unsqueeze(1) # (B, 1, H, W)
-                mask_latents = F.interpolate(mask, size=latents.shape[2:], mode="nearest")
-                
-                # Concatenate
+                # Concatenate inpainting inputs: [noisy_latents, mask, masked_source_latents]
+                # Total channels: 4 + 1 + 4 = 9
                 unet_input = torch.cat([noisy_latents, mask_latents, masked_latents], dim=1)
                 
-                # Predict
+                # ====================================================================
+                # PHASE 5: UNET PREDICTION
+                # ====================================================================
+                # UNet predicts the noise that was added to TARGET latents
+                # Conditions guide it to generate new color while preserving structure
+                
                 noise_pred = unet(
-                    unet_input,
+                    unet_input,  # [B, 9, 64, 64]
                     timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    down_block_additional_residuals=down_block_res_samples,
-                    mid_block_additional_residual=mid_block_res_sample,
-                    added_cond_kwargs=added_cond_kwargs
+                    encoder_hidden_states=encoder_hidden_states,  # Text embeddings
+                    down_block_additional_residuals=down_block_res_samples,  # ControlNet (structure)
+                    mid_block_additional_residual=mid_block_res_sample,  # ControlNet (structure)
+                    added_cond_kwargs=added_cond_kwargs  # IP-Adapter (color)
                 ).sample
                 
-                # 4. Loss
-                # Masked Loss?
-                # Only punish loss in wall region.
-                # mask is 1 for wall, 0 for background.
-                # Actually, target contains background (from original).
-                # We want to reconstruct everything, but focus on Wall?
-                # Simple MSE is fine, or weighted.
-                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="none")
-                loss = loss.mean()
+                # ====================================================================
+                # PHASE 6: LOSS COMPUTATION
+                # ====================================================================
+                # Loss: MSE between predicted noise and actual noise
+                # The model learns to predict what noise was added to TARGET image
+                # This teaches it to generate new colors (target) from conditions
                 
+                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                
+                # Backward pass
                 accelerator.backward(loss)
+                
+                # Gradient clipping for stability
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(unet.parameters(), 1.0)
+                
                 optimizer.step()
+                lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
             
-            if global_step % 20 == 0: # Check more frequently for short run
-                 logging.info(f"Step {global_step}, Loss: {loss.item()}")
+            # Logging
+            if global_step % 20 == 0:
+                logs = {
+                    "loss": loss.detach().item(),
+                    "lr": optimizer.param_groups[0]["lr"],
+                    "epoch": epoch,
+                }
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
+                logging.info(f"Step {global_step}, Loss: {loss.item():.4f}")
                  
-            # Validation every 50 steps (or less for testing)
+            # Validation and checkpointing
             if global_step > 0 and global_step % 50 == 0:
-                 validate_and_save(accelerator, unet, controlnet, vae, text_encoder, tokenizer, image_encoder, val_dataloader, global_step, weight_dtype, args.output_dir)
+                validate_and_save(
+                    accelerator, unet, controlnet, vae, text_encoder, tokenizer, 
+                    image_encoder, val_dataloader, global_step, weight_dtype, args.output_dir
+                )
+                
+                # Save checkpoint
+                if accelerator.is_main_process:
+                    checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    accelerator.save_state(checkpoint_dir)
+                    logging.info(f"Saved checkpoint to {checkpoint_dir}")
 
             global_step += 1
             
-    # Final validation
-    validate_and_save(accelerator, unet, controlnet, vae, text_encoder, tokenizer, image_encoder, val_dataloader, global_step, weight_dtype, args.output_dir)
+    # Final validation and checkpoint
+    if accelerator.is_main_process:
+        validate_and_save(
+            accelerator, unet, controlnet, vae, text_encoder, tokenizer, 
+            image_encoder, val_dataloader, global_step, weight_dtype, args.output_dir
+        )
+        
+        # Save final checkpoint
+        final_checkpoint_dir = os.path.join(args.output_dir, "checkpoint-final")
+        accelerator.save_state(final_checkpoint_dir)
+        logging.info(f"Saved final checkpoint to {final_checkpoint_dir}")
 
     print("Training Complete.")
-    accelerator.save_state(args.output_dir)
+    accelerator.end_training()
 
 if __name__ == "__main__":
     main()

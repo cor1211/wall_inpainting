@@ -45,6 +45,11 @@ models/
 2.6.0
 
 lora_checkpoints/
-training_ready
-paired_dataset_v1
-outputs
+training_ready/
+paired_dataset_v1/
+outputs/
+output/
+test_raw_data/
+
+dataset_test/
+
