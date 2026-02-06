@@ -1,0 +1,1 @@
+python train.py --data_json dataset_test/train/metadata.jsonl --validation_json dataset_test/validation/metadata.jsonl --output_dir output/test_run_validation --train_batch_size 1 --num_train_epochs 5 --report_to none

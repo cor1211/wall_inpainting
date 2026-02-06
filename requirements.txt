@@ -1,5 +1,6 @@
 # --- Core HuggingFace & Diffusers ---
 diffusers>=0.27.2
+peft>=0.10.0
 transformers>=4.39.0
 accelerate>=0.28.0
 safetensors>=0.4.2
