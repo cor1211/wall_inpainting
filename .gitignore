@@ -38,8 +38,10 @@ outputs/
 runs/
 checkpoints/
 
-dataset/
-
+dataset/training_ready
+dataset/clean
+dataset/__pycache__
+``
 models/
 
 2.6.0
