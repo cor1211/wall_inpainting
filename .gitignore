@@ -42,7 +42,8 @@ dataset/training_ready
 dataset/clean
 dataset/__pycache__
 ``
-models/
+models/FastSAM-x.pt
+models/__pycache__
 
 2.6.0
 
