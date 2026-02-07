@@ -90,9 +90,9 @@ def validate_and_save(accelerator, unet, controlnet, vae, text_encoder, tokenize
         # 3. ControlNet Condition: Use SOURCE image (old wall) for structure preservation
         # conditional_images is already preprocessed (depth/canny) from dataset
         control_images = batch["conditional_images"].to(device, dtype=weight_dtype)
-        # Convert to [-1, 1] if needed (ControlNet expects normalized)
-        if control_images.max() <= 1.0:
-            control_images = control_images * 2.0 - 1.0
+        control_images = batch["conditional_images"].to(device, dtype=weight_dtype)
+        # ControlNet expects [0, 1] for depth map. Dataset provides [0, 1].
+        control_images_normalized = control_images
         
         # 4. IP-Adapter: Use COLOR REFERENCE (new color) for color transfer
         pixel_values_ip = batch["color_patches"].to(device, dtype=weight_dtype)
@@ -128,27 +128,77 @@ def validate_and_save(accelerator, unet, controlnet, vae, text_encoder, tokenize
         # Denoising loop
         with accelerator.autocast():
             for t in timesteps:
-                # Concatenate Inpainting inputs: [noisy_latents, mask, masked_source_latents]
-                unet_input = torch.cat([latents, mask_latents, masked_latents], dim=1)
+                # 1. Expand latents for classifier-free guidance
+                # [B, 4, 64, 64] -> [2*B, 4, 64, 64]
+                latent_model_input = torch.cat([latents] * 2)
+                latent_model_input = val_scheduler.scale_model_input(latent_model_input, t)
+
+                # 2. Expand ControlNet condition
+                # [B, 3, 512, 512] -> [2*B, 3, 512, 512]
+                control_model_input = torch.cat([control_images] * 2)
                 
-                # ControlNet: Preserve structure from source image
+                # 3. Expand Encoder Hidden States (Text Embeddings)
+                # We need negative embeddings (unconditional)
+                # [B, 77, 768] -> [2*B, 77, 768] (Neg + Pos)
+                
+                # Create unconditional embeddings (negative prompt)
+                uncond_tokens = [""] * bsz
+                max_length = inputs.input_ids.shape[-1]
+                uncond_input = tokenizer(
+                    uncond_tokens,
+                    padding="max_length",
+                    max_length=max_length,
+                    truncation=True,
+                    return_tensors="pt"
+                )
+                uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0]
+                
+                # Concatenate [uncond, cond]
+                text_embeddings = torch.cat([uncond_embeddings, encoder_hidden_states])
+                
+                # 4. Expand Inpainting Inputs
+                # Mask: [B, 1, 64, 64] -> [2*B, 1, 64, 64]
+                # Masked Latents: [B, 4, 64, 64] -> [2*B, 4, 64, 64]
+                mask_input = torch.cat([mask_latents] * 2)
+                masked_latents_input = torch.cat([masked_latents] * 2)
+                
+                # 5. Expand IP-Adapter Embeddings
+                # [B, 1, 1280] -> [2*B, 1, 1280] (Zeroed/Neg + Pos)
+                # Usually we use zero embeddings or negative embeddings for uncond
+                # But IP-Adapter often just repeats image embeds for uncond if not dropping
+                # HOWEVER, for proper guidance, we should drop image embeds for uncond part.
+                # IP-Adapter Plus usually handles this via image_embeds argument.
+                # Let's mock unconditional image embeds (zeros)
+                uncond_image_embeds = torch.zeros_like(image_embeds)
+                image_embeds_input = torch.cat([uncond_image_embeds, image_embeds])
+                added_cond_kwargs_input = {"image_embeds": image_embeds_input}
+
+                # Concatenate Inputs for UNet [latents, mask, masked_latents]
+                unet_input = torch.cat([latent_model_input, mask_input, masked_latents_input], dim=1)
+                
+                # ControlNet Forward (Batched)
                 down_block_res_samples, mid_block_res_sample = controlnet(
-                    latents,
+                    latent_model_input,
                     t,
-                    encoder_hidden_states=encoder_hidden_states,
-                    controlnet_cond=control_images,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=control_model_input,
                     return_dict=False,
                 )
                 
-                # UNet: Predict noise with all conditions
+                # UNet Forward (Batched)
                 noise_pred = unet(
                     unet_input,
                     t,
-                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states=text_embeddings,
                     down_block_additional_residuals=down_block_res_samples,
                     mid_block_additional_residual=mid_block_res_sample,
-                    added_cond_kwargs=added_cond_kwargs
+                    added_cond_kwargs=added_cond_kwargs_input
                 ).sample
+                
+                # Perform Guidance
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                guidance_scale = 7.5
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 
                 # Denoising step
                 latents = val_scheduler.step(noise_pred, t, latents).prev_sample
@@ -459,8 +509,8 @@ def main():
                 # B. ControlNet Condition: Use SOURCE image (old wall) for structure
                 # conditional_images is depth map (or canny) preprocessed from SOURCE image
                 control_images = batch["conditional_images"].to(dtype=weight_dtype)  # [B, 3, H, W] (0-1)
-                # Convert to [-1, 1] for ControlNet
-                control_images_normalized = control_images * 2.0 - 1.0
+                # ControlNet expects [0, 1] range. DO NOT normalize to [-1, 1].
+                control_images_normalized = control_images
                 
                 # ControlNet forward: Preserve structure from source image
                 down_block_res_samples, mid_block_res_sample = controlnet(
@@ -577,7 +627,7 @@ def main():
                 logging.info(f"Step {global_step}, Loss: {loss.item():.4f}")
                  
             # Validation and checkpointing
-            if global_step > 0 and global_step % 50 == 0:
+            if global_step > 0 and global_step % 200 == 0:
                 validate_and_save(
                     accelerator, unet, controlnet, vae, text_encoder, tokenizer, 
                     image_encoder, val_dataloader, global_step, weight_dtype, args.output_dir

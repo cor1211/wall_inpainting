@@ -7,6 +7,44 @@ Functions to create color reference patches for IP-Adapter.
 import numpy as np
 from PIL import Image
 from typing import Tuple, Union
+import random
+
+
+# Common wall colors for augmentation
+WALL_COLORS = [
+    ("Beige", (245, 245, 220)),
+    ("Cream", (255, 253, 208)),
+    ("Off-White", (250, 249, 246)),
+    ("Light Gray", (211, 211, 211)),
+    ("Sage Green", (188, 238, 104)),
+    ("Pale Blue", (173, 216, 230)),
+    ("Terracotta", (226, 114, 91)),
+    ("Charcoal", (54, 69, 79)),
+    ("Navy Blue", (0, 0, 128)),
+    ("Dusty Rose", (220, 174, 150)),
+    ("Lavender", (230, 230, 250)),
+    ("Mint", (189, 252, 201)),
+    ("Peach", (255, 229, 180)),
+    ("Sky Blue", (135, 206, 235)),
+    ("Teal", (0, 128, 128)),
+    ("Mustard", (255, 219, 88)),
+    ("Olive", (128, 128, 0)),
+    ("Coral", (255, 127, 80)),
+    ("Salmon", (250, 128, 114)),
+    ("Taupe", (72, 60, 50)),
+    ("Warm White", (255, 248, 220)),
+    ("Cool Gray", (140, 146, 172)),
+]
+
+
+def sample_random_color() -> Tuple[str, Tuple[int, int, int]]:
+    """
+    Sample a random wall color from the predefined palette.
+    
+    Returns:
+        tuple: (color_name, (r, g, b))
+    """
+    return random.choice(WALL_COLORS)
 
 
 def create_color_patch(

@@ -1,372 +1,179 @@
-"""
-Dataset Cleaning Script
-
-Cleans the refined dataset by:
-1. Removing train/val overlap (data leakage prevention)
-2. Removing duplicates
-3. Removing failed samples (surface_too_large, too_many_components)
-
-Based on validation_report.json output.
-
-Usage:
-    python clean_dataset.py --input dataset/refined --output dataset/clean --report validation_report.json
-"""
 
 import os
 import json
-import shutil
-import hashlib
 import argparse
 from pathlib import Path
-from typing import Set, Dict, List, Tuple
-from dataclasses import dataclass
-from tqdm import tqdm
-import numpy as np
-from PIL import Image
-import cv2
+from typing import Set, List, Dict
 
-
-# ============== Thresholds (same as validate_dataset.py) ==============
-MIN_SURFACE_RATIO = 0.03
-MAX_SURFACE_RATIO = 0.85
-MAX_CONNECTED_COMPONENTS = 5
-
-
-@dataclass
-class CleaningStats:
-    """Statistics from cleaning process."""
-    original_train: int
-    original_val: int
-    removed_overlaps: int
-    removed_duplicates: int
-    removed_failed: int
-    final_train: int
-    final_val: int
-
-
-def calculate_file_hash(path: Path) -> str:
-    """Calculate MD5 hash of file."""
-    hash_md5 = hashlib.md5()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
-
-
-def find_duplicates(images_dir: Path) -> Dict[str, List[str]]:
-    """
-    Find duplicate images based on file hash.
-    
-    Returns:
-        Dict mapping hash to list of filenames with that hash.
-    """
-    hash_to_files = {}
-    
-    for img_path in images_dir.glob("*.*"):
-        if img_path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
-            file_hash = calculate_file_hash(img_path)
-            
-            if file_hash not in hash_to_files:
-                hash_to_files[file_hash] = []
-            hash_to_files[file_hash].append(img_path.name)
-    
-    # Filter to only duplicates
-    duplicates = {h: files for h, files in hash_to_files.items() if len(files) > 1}
-    
-    return duplicates
-
-
-def find_train_val_overlap(
-    train_images: Path,
-    val_images: Path,
-) -> Set[str]:
-    """
-    Find files that exist in both train and validation sets.
-    
-    Returns:
-        Set of filenames in validation that overlap with train.
-    """
-    train_hashes = {}
-    
-    for img_path in train_images.glob("*.*"):
-        if img_path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
-            file_hash = calculate_file_hash(img_path)
-            train_hashes[file_hash] = img_path.name
-    
-    overlap = set()
-    for img_path in val_images.glob("*.*"):
-        if img_path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
-            file_hash = calculate_file_hash(img_path)
-            if file_hash in train_hashes:
-                overlap.add(img_path.stem)  # Return stem for matching with mask
-    
-    return overlap
-
-
-def validate_sample(mask_path: Path) -> Tuple[bool, List[str]]:
-    """
-    Validate a single sample.
-    
-    Returns:
-        (is_valid, list of issues)
-    """
-    issues = []
-    
+def get_file_size(path: Path) -> int:
     try:
-        mask = np.array(Image.open(mask_path))
-    except Exception as e:
-        return False, [f"load_error: {str(e)}"]
-    
-    # Surface ratio check
-    binary = mask > 127
-    surface_ratio = binary.sum() / binary.size
-    
-    if surface_ratio < MIN_SURFACE_RATIO:
-        issues.append("surface_too_small")
-    elif surface_ratio > MAX_SURFACE_RATIO:
-        issues.append("surface_too_large")
-    
-    # Connected components check
-    binary_uint8 = binary.astype(np.uint8)
-    num_labels, _ = cv2.connectedComponents(binary_uint8)
-    num_components = num_labels - 1
-    
-    if num_components > MAX_CONNECTED_COMPONENTS:
-        issues.append("too_many_components")
-    
-    if num_components == 0 and surface_ratio > 0:
-        issues.append("empty_mask")
-    
-    return len(issues) == 0, issues
+        if path.exists():
+            return path.stat().st_size
+        return -1 # File not found
+    except Exception:
+        return -1
 
-
-def clean_split(
-    input_path: Path,
-    output_path: Path,
-    split: str,
-    samples_to_remove: Set[str],
-) -> Tuple[int, int]:
+def validate_entry(entry: Dict, dataset_dir: Path) -> bool:
     """
-    Clean a single split by copying valid samples.
-    
-    Returns:
-        (original_count, final_count)
+    Validates a metadata entry.
+    All referenced files must exist AND be > 0 bytes.
     """
-    input_images = input_path / split / "images"
-    input_masks = input_path / split / "masks"
-    
-    output_images = output_path / split / "images"
-    output_masks = output_path / split / "masks"
-    
-    output_images.mkdir(parents=True, exist_ok=True)
-    output_masks.mkdir(parents=True, exist_ok=True)
-    
-    mask_files = list(input_masks.glob("*.png"))
-    original_count = len(mask_files)
-    final_count = 0
-    
-    for mask_path in tqdm(mask_files, desc=f"Cleaning {split}"):
-        sample_name = mask_path.stem
-        
-        # Skip if in removal list
-        if sample_name in samples_to_remove:
-            continue
-        
-        # Find corresponding image
-        image_path = input_images / f"{sample_name}.png"
-        if not image_path.exists():
-            image_path = input_images / f"{sample_name}.jpg"
-        
-        if not image_path.exists():
-            continue
-        
-        # Re-validate sample
-        is_valid, issues = validate_sample(mask_path)
-        
-        if not is_valid:
-            continue
-        
-        # Copy to output
-        shutil.copy2(mask_path, output_masks / mask_path.name)
-        shutil.copy2(image_path, output_images / image_path.name)
-        
-        final_count += 1
-    
-    return original_count, final_count
-
-
-def clean_dataset(
-    input_path: Path,
-    output_path: Path,
-    validation_report: Path = None,
-) -> CleaningStats:
-    """
-    Clean the entire dataset.
-    """
-    print("=" * 60)
-    print("DATASET CLEANING")
-    print("=" * 60)
-    
-    samples_to_remove_train = set()
-    samples_to_remove_val = set()
-    
-    # Step 1: Find train/val overlap
-    print("\n1. Finding train/val overlap...")
-    train_images = input_path / "train" / "images"
-    val_images = input_path / "validation" / "images"
-    
-    if train_images.exists() and val_images.exists():
-        overlap = find_train_val_overlap(train_images, val_images)
-        print(f"   Found {len(overlap)} overlapping samples")
-        samples_to_remove_val.update(overlap)  # Remove from val to avoid leakage
-    
-    # Step 2: Find duplicates in each split
-    print("\n2. Finding duplicates...")
-    for split in ["train", "validation"]:
-        images_dir = input_path / split / "images"
-        if images_dir.exists():
-            duplicates = find_duplicates(images_dir)
-            dup_count = sum(len(files) - 1 for files in duplicates.values())
-            print(f"   {split}: {dup_count} duplicates")
+    for key in ["source_path", "target_path", "mask_path"]:
+        rel_path = entry.get(key)
+        if not rel_path:
+            continue # Should be fine if optional, but here all are required
             
-            # Keep first, remove rest
-            for files in duplicates.values():
-                for f in files[1:]:  # Skip first
-                    stem = Path(f).stem
-                    if split == "train":
-                        samples_to_remove_train.add(stem)
-                    else:
-                        samples_to_remove_val.add(stem)
-    
-    # Step 3: Load failed samples from validation report
-    if validation_report and validation_report.exists():
-        print(f"\n3. Loading failed samples from {validation_report}...")
-        with open(validation_report) as f:
-            report = json.load(f)
+        abs_path = dataset_dir / rel_path
+        size = get_file_size(abs_path)
         
-        failed = report.get("failed_sample_names", [])
-        print(f"   Found {len(failed)} failed samples in report")
+        if size <= 0:
+            # File missing (size -1) or empty (size 0)
+            return False
+            
+    return True
+
+def get_all_files(root_dir: Path, subdirs: List[str]) -> Set[str]:
+    """
+    Recursively finds all files in the specified subdirectories relative to root_dir.
+    Returns a set of relative paths (strings).
+    """
+    found_files = set()
+    for subdir in subdirs:
+        abs_subdir = root_dir / subdir
+        if not abs_subdir.exists():
+            continue
+            
+        for root, _, files in os.walk(abs_subdir):
+            for file in files:
+                abs_path = Path(root) / file
+                rel_path = abs_path.relative_to(root_dir)
+                found_files.add(str(rel_path))
+    return found_files
+
+def process_metadata(dataset_dir: Path, meta_rel_path: str, dry_run: bool) -> Set[str]:
+    """
+    Reads metadata, filters invalid entries, writes back cleaned metadata (if not dry_run).
+    Returns a set of VALID referenced file paths.
+    """
+    meta_path = dataset_dir / meta_rel_path
+    if not meta_path.exists():
+        print(f"[WARN] Metadata file not found: {meta_path}")
+        return set()
+    
+    valid_entries = []
+    invalid_entries = []
+    valid_paths = set()
+    
+    print(f"Processing metadata: {meta_path}")
+    
+    with open(meta_path, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            try:
+                entry = json.loads(line.strip())
+                if validate_entry(entry, dataset_dir):
+                    valid_entries.append(entry)
+                    valid_paths.add(entry.get("source_path"))
+                    valid_paths.add(entry.get("target_path"))
+                    valid_paths.add(entry.get("mask_path"))
+                else:
+                    invalid_entries.append((i, entry))
+            except json.JSONDecodeError:
+                print(f"[ERR] Failed to decode line {i} in {meta_path}")
+                
+    print(f"  Total lines: {len(valid_entries) + len(invalid_entries)}")
+    print(f"  Valid entries: {len(valid_entries)}")
+    print(f"  Invalid entries (missing/0kb files): {len(invalid_entries)}")
+    
+    if len(invalid_entries) > 0:
+        print("  Example invalid entries:")
+        for idx, entry in invalid_entries[:5]:
+             print(f"    Line {idx}: {entry.get('target_path')} (likely 0kb or missing)")
+
+    # Rewrite metadata if not dry run
+    if not dry_run and len(invalid_entries) > 0:
+        # Create backup
+        backup_path = meta_path.with_suffix(".jsonl.bak")
+        print(f"  Backing up original metadata to {backup_path}")
+        import shutil
+        shutil.copy2(meta_path, backup_path)
         
-        # Will be filtered during copy anyway via re-validation
-    
-    # Step 4: Clean each split
-    print("\n4. Cleaning splits...")
-    
-    stats = {
-        "original_train": 0,
-        "original_val": 0,
-        "final_train": 0,
-        "final_val": 0,
-    }
-    
-    for split in ["train", "validation"]:
-        if (input_path / split).exists():
-            remove_set = samples_to_remove_train if split == "train" else samples_to_remove_val
-            orig, final = clean_split(input_path, output_path, split, remove_set)
-            stats[f"original_{split[:5]}"] = orig
-            stats[f"final_{split[:5]}"] = final
-    
-    # Step 5: Create dataset info
-    print("\n5. Creating dataset info...")
-    
-    info = {
-        "source": str(input_path),
-        "cleaned": True,
-        "train_samples": stats["final_train"],
-        "val_samples": stats["final_val"],
-        "removed": {
-            "overlap": len(overlap) if val_images.exists() else 0,
-            "duplicates": len(samples_to_remove_train) + len(samples_to_remove_val) - len(overlap),
-            "failed_validation": (stats["original_train"] + stats["original_val"]) - 
-                                 (stats["final_train"] + stats["final_val"]) - 
-                                 len(samples_to_remove_train) - len(samples_to_remove_val),
-        }
-    }
-    
-    with open(output_path / "dataset_info.json", 'w') as f:
-        json.dump(info, f, indent=2)
-    
-    return CleaningStats(
-        original_train=stats["original_train"],
-        original_val=stats["original_val"],
-        removed_overlaps=len(overlap) if val_images.exists() else 0,
-        removed_duplicates=len(samples_to_remove_train) + len(samples_to_remove_val),
-        removed_failed=(stats["original_train"] + stats["original_val"]) - 
-                       (stats["final_train"] + stats["final_val"]),
-        final_train=stats["final_train"],
-        final_val=stats["final_val"],
-    )
+        print(f"  Overwriting {meta_path} with {len(valid_entries)} valid entries...")
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            for entry in valid_entries:
+                f.write(json.dumps(entry) + "\n")
+                
+    elif dry_run and len(invalid_entries) > 0:
+        print("  [DRY RUN] Would rewrite metadata to exclude invalid entries.")
 
-
-def print_summary(stats: CleaningStats):
-    """Print cleaning summary."""
-    print("\n" + "=" * 60)
-    print("CLEANING SUMMARY")
-    print("=" * 60)
-    print(f"Original train:     {stats.original_train}")
-    print(f"Original val:       {stats.original_val}")
-    print(f"Original total:     {stats.original_train + stats.original_val}")
-    print("-" * 40)
-    print(f"Removed overlaps:   {stats.removed_overlaps}")
-    print(f"Removed duplicates: {stats.removed_duplicates}")
-    print(f"Removed failed:     {stats.removed_failed}")
-    print(f"Total removed:      {stats.removed_overlaps + stats.removed_duplicates + stats.removed_failed}")
-    print("-" * 40)
-    print(f"Final train:        {stats.final_train}")
-    print(f"Final val:          {stats.final_val}")
-    print(f"Final total:        {stats.final_train + stats.final_val}")
-    print("=" * 60)
-    
-    # Verify no overlap
-    print("\n✅ Data leakage: FIXED (train/val overlap removed)")
-    print("✅ Duplicates: FIXED")
-    print("✅ Failed samples: REMOVED")
-    print("\nDataset is now clean and ready for training!")
-
+    return {p for p in valid_paths if p}
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Clean dataset by removing overlaps, duplicates, and failed samples"
-    )
-    parser.add_argument(
-        "--input", "-i",
-        type=str,
-        required=True,
-        help="Input refined dataset path"
-    )
-    parser.add_argument(
-        "--output", "-o",
-        type=str,
-        required=True,
-        help="Output clean dataset path"
-    )
-    parser.add_argument(
-        "--report", "-r",
-        type=str,
-        default="validation_report.json",
-        help="Validation report JSON (optional)"
-    )
+    parser = argparse.ArgumentParser(description="Clean dataset by removing 0kb files and syncing metadata.")
+    parser.add_argument("--dataset_dir", type=str, required=True, help="Path to the dataset directory")
+    parser.add_argument("--dry-run", action="store_true", help="If set, only simulate actions.")
     
     args = parser.parse_args()
+    dataset_dir = Path(args.dataset_dir).resolve()
     
-    input_path = Path(args.input)
-    output_path = Path(args.output)
-    report_path = Path(args.report) if args.report else None
-    
-    if not input_path.exists():
-        print(f"Error: Input path does not exist: {input_path}")
-        return 1
-    
-    # Clean dataset
-    stats = clean_dataset(input_path, output_path, report_path)
-    
-    # Print summary
-    print_summary(stats)
-    
-    print(f"\nClean dataset saved to: {output_path}")
-    
-    return 0
+    if not dataset_dir.exists():
+        print(f"Error: Dataset directory {dataset_dir} does not exist.")
+        return
 
+    print(f"--- Dataset Cleaning Tool ---")
+    print(f"Target: {dataset_dir}")
+    print(f"Mode: {'DRY RUN' if args.dry_run else 'DESTRUCTIVE EXECUTON'}")
+    
+    # 1. Process Metadata & Collect Valid Paths
+    all_valid_paths = set()
+    
+    # Train
+    all_valid_paths.update(process_metadata(dataset_dir, "train/metadata.jsonl", args.dry_run))
+    # Validation
+    all_valid_paths.update(process_metadata(dataset_dir, "validation/metadata.jsonl", args.dry_run))
+    
+    print(f"\nTotal valid file references allowed: {len(all_valid_paths)}")
+    
+    # 2. Scan Disk for Orphans (Unreferenced files)
+    # Note: Valid files (referenced but 0kb) were excluded from all_valid_paths by process_metadata
+    # So they will appear as orphans here and get deleted!
+    check_subdirs = [
+        "train/images", "train/masks", 
+        "validation/images", "validation/masks"
+    ]
+    
+    print("\nScanning disk for unreferenced files...")
+    files_on_disk = get_all_files(dataset_dir, check_subdirs)
+    print(f"Total files on disk: {len(files_on_disk)}")
+    
+    orphans = files_on_disk - all_valid_paths
+    
+    if not orphans:
+        print("\nSuccess! Dataset is perfectly synchronized.")
+    else:
+        print(f"\nFound {len(orphans)} files to delete (orphans or corrupted/0kb).")
+        sorted_orphans = sorted(list(orphans))
+        
+        if args.dry_run:
+            print("[DRY RUN] Files that would be deleted:")
+            for o in sorted_orphans[:20]:
+                abs_p = dataset_dir / o
+                sz = get_file_size(abs_p)
+                status = "0KB" if sz == 0 else f"{sz} bytes"
+                print(f"  [DELETE] {o} ({status})")
+            if len(sorted_orphans) > 20:
+                print(f"  ... and {len(sorted_orphans) - 20} more.")
+        else:
+            print(f"Deleting {len(orphans)} files...")
+            count = 0 
+            for o in sorted_orphans:
+                abs_p = dataset_dir / o
+                try:
+                    if abs_p.exists():
+                        os.remove(abs_p)
+                        count += 1
+                except Exception as e:
+                    print(f"Failed to delete {o}: {e}")
+            print(f"Deleted {count} files.")
 
 if __name__ == "__main__":
-    exit(main())
+    main()
